@@ -26,6 +26,24 @@ const LIST_PREFIXES = {
 
 const LIST_PREFIX_PATTERN = /^(?:[•◦◆→✓☐☑]\s+|\d+\.\s+)/;
 
+// ── Détermine la première et la dernière ligne touchées par la sélection ──
+// (comportement Word : une action de liste ne s'applique qu'à la ligne du
+// curseur, ou à toutes les lignes couvertes par une sélection multi-lignes).
+const getSelectedLineRange = (text, selStart, selEnd) => {
+  const lines = text.split('\n');
+  let charCount = 0;
+  let startLine = 0;
+  let endLine = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineStart = charCount;
+    const lineEnd = charCount + lines[i].length;
+    if (selStart >= lineStart && selStart <= lineEnd) startLine = i;
+    if (selEnd >= lineStart && selEnd <= lineEnd) endLine = i;
+    charCount = lineEnd + 1;
+  }
+  return [startLine, endLine];
+};
+
 const DEFAULT_TEXT_FORMAT = {
   bold: false,
   italic: false,
@@ -95,6 +113,20 @@ const hashesMatch = (firstHash, secondHash) => {
   return difference === 0;
 };
 
+// ── Style de scroll réutilisable pour le corps des cartes ────────────────
+// overflowY: 'auto' fait apparaître le défilement seulement si nécessaire,
+// scrollbarWidth/scrollbarColor rendent la barre visible sur Firefox,
+// et la classe CSS injectée plus bas gère le style sur Chrome/Safari.
+const SCROLLABLE_BODY_STYLE = {
+  overflowY: 'scroll',
+  overflowX: 'hidden',
+  minHeight: 0,
+  WebkitOverflowScrolling: 'touch',
+  overscrollBehavior: 'contain',
+  scrollbarWidth: 'thin',
+  scrollbarColor: 'rgba(0,0,0,0.35) rgba(0,0,0,0.06)',
+};
+
 export default function NoteEditor({
   notes, setNotes, selectedId,
 }) {
@@ -117,6 +149,7 @@ export default function NoteEditor({
   const [mediaLoading, setMediaLoading] = useState(false);
   const [tableCtxMenu, setTableCtxMenu] = useState(null);
   const fileInputRef = useRef(null);
+  const mainTextareaRef = useRef(null);
 
   useEffect(() => {
     if (!mediaModal) return undefined;
@@ -256,8 +289,16 @@ export default function NoteEditor({
   const disableList = () => {
     if (!note) return;
     const currentText = note.cards?.[0]?.text ?? note.text ?? '';
-    updateMainText(removeListFormatting(currentText));
-    setActiveListType(null);
+    const textarea = mainTextareaRef.current;
+    const selStart = textarea ? textarea.selectionStart : 0;
+    const selEnd = textarea ? textarea.selectionEnd : 0;
+    const [startLine, endLine] = getSelectedLineRange(currentText, selStart, selEnd);
+    const lines = currentText.split('\n');
+    const newLines = lines.map((line, idx) => (
+      idx >= startLine && idx <= endLine ? line.replace(LIST_PREFIX_PATTERN, '') : line
+    ));
+    updateMainText(newLines.join('\n'));
+    if (startLine === 0 && endLine >= lines.length - 1) setActiveListType(null);
     closeAll();
   };
 
@@ -268,39 +309,83 @@ export default function NoteEditor({
       return;
     }
 
+    const currentText = note.cards?.[0]?.text ?? note.text ?? '';
+    const textarea = mainTextareaRef.current;
+    const selStart = textarea ? textarea.selectionStart : 0;
+    const selEnd = textarea ? textarea.selectionEnd : currentText.length;
+    const [startLine, endLine] = getSelectedLineRange(currentText, selStart, selEnd);
     const prefix = LIST_PREFIXES[type];
-    const currentText = removeListFormatting(note.cards?.[0]?.text ?? note.text ?? '');
-    const lines = currentText ? currentText.split('\n') : [''];
-    const formattedText = lines.map((line, index) => (
-      type === 'num' ? `${index + 1}. ${line}` : `${prefix}${line}`
-    )).join('\n');
+    const lines = currentText.split('\n');
+    let counter = 1;
+    const newLines = lines.map((line, idx) => {
+      if (idx < startLine || idx > endLine) return line;
+      const stripped = line.replace(LIST_PREFIX_PATTERN, '');
+      const formatted = type === 'num' ? `${counter}. ${stripped}` : `${prefix}${stripped}`;
+      counter += 1;
+      return formatted;
+    });
 
-    updateMainText(formattedText);
+    updateMainText(newLines.join('\n'));
     setActiveListType(type);
     closeAll();
   };
 
-  const handleListEnter = (event) => {
-    if (event.key !== 'Enter' || !activeListType) return;
-    event.preventDefault();
-
+  const handleListKeyDown = (event) => {
+    if (!activeListType) return;
     const textarea = event.currentTarget;
     const selectionStart = textarea.selectionStart;
     const selectionEnd = textarea.selectionEnd;
     const currentText = textarea.value;
-    const beforeCursor = currentText.slice(0, selectionStart);
-    const afterCursor = currentText.slice(selectionEnd);
-    const nextNumber = beforeCursor.split('\n').length + 1;
-    const nextPrefix = activeListType === 'num'
-      ? `${nextNumber}. `
-      : LIST_PREFIXES[activeListType];
-    const newText = `${beforeCursor}\n${nextPrefix}${afterCursor}`;
-    const newCursorPosition = selectionStart + nextPrefix.length + 1;
 
-    updateMainText(newText);
-    requestAnimationFrame(() => {
-      textarea.setSelectionRange(newCursorPosition, newCursorPosition);
-    });
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const beforeCursor = currentText.slice(0, selectionStart);
+      const afterCursor = currentText.slice(selectionEnd);
+      const beforeLines = beforeCursor.split('\n');
+      const currentLine = beforeLines[beforeLines.length - 1];
+      const prefixMatch = currentLine.match(LIST_PREFIX_PATTERN);
+      const lineWithoutPrefix = currentLine.replace(LIST_PREFIX_PATTERN, '');
+
+      // Comportement Word : Entrée sur une puce vide sort de la liste
+      // (seule cette ligne perd sa puce, les autres restent inchangées).
+      if (prefixMatch && lineWithoutPrefix.trim() === '') {
+        const linesBeforeWithoutLast = beforeLines.slice(0, -1);
+        const newBeforeCursor = [...linesBeforeWithoutLast, ''].join('\n');
+        updateMainText(newBeforeCursor + afterCursor);
+        setActiveListType(null);
+        const newCursorPosition = newBeforeCursor.length;
+        requestAnimationFrame(() => textarea.setSelectionRange(newCursorPosition, newCursorPosition));
+        return;
+      }
+
+      const nextNumber = beforeLines.length + 1;
+      const nextPrefix = activeListType === 'num' ? `${nextNumber}. ` : LIST_PREFIXES[activeListType];
+      const newText = `${beforeCursor}\n${nextPrefix}${afterCursor}`;
+      const newCursorPosition = selectionStart + nextPrefix.length + 1;
+
+      updateMainText(newText);
+      requestAnimationFrame(() => textarea.setSelectionRange(newCursorPosition, newCursorPosition));
+      return;
+    }
+
+    if (event.key === 'Backspace' && selectionStart === selectionEnd) {
+      const beforeCursor = currentText.slice(0, selectionStart);
+      const beforeLines = beforeCursor.split('\n');
+      const currentLine = beforeLines[beforeLines.length - 1];
+      const prefixMatch = currentLine.match(LIST_PREFIX_PATTERN);
+
+      // Retour arrière juste après une puce : retire uniquement cette puce,
+      // sans toucher aux autres lignes (comportement Word).
+      if (prefixMatch && currentLine === prefixMatch[0]) {
+        event.preventDefault();
+        const afterCursor = currentText.slice(selectionStart);
+        const linesBeforeWithoutLast = beforeLines.slice(0, -1);
+        const newBeforeCursor = [...linesBeforeWithoutLast, ''].join('\n');
+        updateMainText(newBeforeCursor + afterCursor);
+        const newCursorPosition = newBeforeCursor.length;
+        requestAnimationFrame(() => textarea.setSelectionRange(newCursorPosition, newCursorPosition));
+      }
+    }
   };
 
   // ── Tableau ───────────────────────────────────────────────────────────────
@@ -637,11 +722,14 @@ export default function NoteEditor({
     const mainText = note.cards && note.cards[0] ? note.cards[0].text : note.text;
 
     return (
-      <div className="sticky-note" style={{ background: pal.body, width: CARD_WIDTH, minHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: '0 3px 8px rgba(0,0,0,0.12)', display: 'flex', flexDirection: 'column', overflow: 'visible', clipPath: 'none' }}>
-        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+      <div className="sticky-note" style={{ background: pal.body, width: CARD_WIDTH, height: CARD_MIN_HEIGHT, maxHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: '0 3px 8px rgba(0,0,0,0.12)', display: 'flex', flexDirection: 'column', overflow: 'hidden', clipPath: 'none' }}>
+        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 0 auto' }}>
           {note.isLocked ? '🔒 Contenu Protégé' : note.title}
         </div>
-        <div className="sticky-body" style={{ padding: '18px 20px', flex: 1, display: 'flex', flexDirection: 'column', overflow: 'visible' }}>
+        <div
+          className="sticky-body sticky-body-scroll"
+          style={{ padding: '18px 20px', flex: 1, display: 'flex', flexDirection: 'column', ...SCROLLABLE_BODY_STYLE }}
+        >
           {note.isLocked ? (
             <div className="lock-masked-screen">
               <i className="fa-solid fa-lock lock-masked-icon"></i>
@@ -653,18 +741,18 @@ export default function NoteEditor({
           ) : (
             <>
               {(note.images || []).map((media) => (
-                <div key={media.id} className="note-image-block">
+                <div key={media.id} className="note-image-block" style={{ flexShrink: 0, flexGrow: 0, width: '100%' }}>
                   {media.mime_type?.startsWith('video/') ? (
                     <video src={media.src} controls playsInline preload="metadata"
-                      style={{ width: '100%', maxHeight: '260px', objectFit: 'contain', borderRadius: '6px' }} />
+                      style={{ width: '100%', height: '260px', maxHeight: '260px', objectFit: 'contain', borderRadius: '6px', display: 'block' }} />
                   ) : (
-                    <img src={media.src} alt={media.name} />
+                    <img src={media.src} alt={media.name} style={{ width: '100%', height: '260px', maxHeight: '260px', objectFit: 'contain', borderRadius: '6px', display: 'block' }} />
                   )}
                   <button className="note-image-remove" onClick={() => updateNote({ images: (note.images || []).filter((i) => i.id !== media.id) })}>✕</button>
                 </div>
               ))}
               {(note.links || []).map((lnk) => (
-                <div key={lnk.id} className="link-preview-card">
+                <div key={lnk.id} className="link-preview-card" style={{ flexShrink: 0 }}>
                   {lnk.thumbnail && (
                     <div className="link-preview-thumb">
                       <img src={lnk.thumbnail} alt={lnk.title} />
@@ -693,8 +781,10 @@ export default function NoteEditor({
                 style={{
                   color: mainTextFormat.color || pal.darkText,
                   width: '100%',
-                  height: (note.tables || []).length > 0 ? '80px' : '220px',
                   minHeight: (note.tables || []).length > 0 ? '80px' : '120px',
+                  flex: '0 0 auto',
+                  flexShrink: 0,
+                  overflow: 'hidden',
                   background: mainTextFormat.backgroundColor || 'transparent',
                   border: 'none',
                   borderLeft: mainTextFormat.style === 'quote' ? '3px solid #ff9500' : 'none',
@@ -713,7 +803,18 @@ export default function NoteEditor({
                   textAlign: mainTextFormat.align,
                 }}
                 onChange={(e) => updateMainText(e.target.value)}
-                onKeyDown={handleListEnter}
+                onInput={(e) => {
+                  e.target.style.height = 'auto';
+                  e.target.style.height = `${e.target.scrollHeight}px`;
+                }}
+                ref={(el) => {
+                  mainTextareaRef.current = el;
+                  if (el) {
+                    el.style.height = 'auto';
+                    el.style.height = `${el.scrollHeight}px`;
+                  }
+                }}
+                onKeyDown={handleListKeyDown}
               />
               {(note.tables || []).map((tbl) => (
                 <div key={tbl.id} className="note-table-wrapper" style={{ position: 'relative', order: -1, margin: '4px 0 12px', padding: '20px 0 0 20px', flexShrink: 0 }}>
@@ -816,15 +917,25 @@ export default function NoteEditor({
     const pal = activePal;
     const globalIdx = subIdx + 1;
     return (
-      <div key={card.id} className="sticky-note" style={{ background: pal.body, width: CARD_WIDTH, minHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: '0 3px 8px rgba(0,0,0,0.12)', display: 'flex', flexDirection: 'column' }}>
-        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+      <div key={card.id} className="sticky-note" style={{ background: pal.body, width: CARD_WIDTH, height: CARD_MIN_HEIGHT, maxHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: '0 3px 8px rgba(0,0,0,0.12)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 0 auto' }}>
           {card.subtitle || 'Untitled'}
         </div>
-        <div className="sticky-body" style={{ padding: '18px 20px', flex: 1 }}>
+        <div className="sticky-body sticky-body-scroll" style={{ padding: '18px 20px', flex: 1, ...SCROLLABLE_BODY_STYLE }}>
           <textarea
             value={card.text || ''}
             placeholder="Start a note..."
-            style={{ color: pal.darkText, width: '100%', minHeight: '120px', background: 'transparent', border: 'none', outline: 'none', resize: 'none', fontSize: '15px', lineHeight: 1.6, fontFamily: 'inherit' }}
+            style={{ color: pal.darkText, width: '100%', minHeight: '120px', flexShrink: 0, overflow: 'hidden', background: 'transparent', border: 'none', outline: 'none', resize: 'none', fontSize: '15px', lineHeight: 1.6, fontFamily: 'inherit' }}
+            onInput={(e) => {
+              e.target.style.height = 'auto';
+              e.target.style.height = `${e.target.scrollHeight}px`;
+            }}
+            ref={(el) => {
+              if (el) {
+                el.style.height = 'auto';
+                el.style.height = `${el.scrollHeight}px`;
+              }
+            }}
             onChange={(e) => {
               setNotes((prev) => prev.map((n) => {
                 if (n.id !== selectedId) return n;
@@ -846,6 +957,36 @@ export default function NoteEditor({
         if (!e.target.closest('.editor-toolbar') && !e.target.closest('.search-wrapper')) closeAll();
         if (!e.target.closest('.table-ctx-menu') && !e.target.closest('.col-handle') && !e.target.closest('.row-handle')) setTableCtxMenu(null);
       }}>
+
+      {/* Styles injectés pour rendre la scrollbar visible sur Chrome / Safari / Edge
+          (WebKit ne respecte pas scrollbarWidth/scrollbarColor en style inline). */}
+      <style>{`
+        /* !important : neutralise toute règle CSS externe (App.css, index.css…)
+           qui imposerait overflow:visible ou height:auto sur ces classes. */
+        .sticky-note {
+          overflow: hidden !important;
+        }
+        .sticky-body-scroll {
+          overflow-y: scroll !important;
+          overflow-x: hidden !important;
+        }
+        .sticky-body-scroll::-webkit-scrollbar {
+          width: 10px;
+        }
+        .sticky-body-scroll::-webkit-scrollbar-track {
+          background: rgba(0, 0, 0, 0.06);
+          border-radius: 8px;
+        }
+        .sticky-body-scroll::-webkit-scrollbar-thumb {
+          background-color: rgba(0, 0, 0, 0.35);
+          border-radius: 8px;
+          border: 2px solid transparent;
+          background-clip: padding-box;
+        }
+        .sticky-body-scroll::-webkit-scrollbar-thumb:hover {
+          background-color: rgba(0, 0, 0, 0.55);
+        }
+      `}</style>
 
       {/* ═══ BARRE D'OUTILS ═══════════════════════════════════════════════
           FIX : style inline en flex-start + gap régulier de 14px pour que
@@ -970,7 +1111,7 @@ export default function NoteEditor({
             <i className="fa-solid fa-list-ul" style={{ fontSize: '15px', color: '#857f7f' }}></i>
           </button>
           {openDD === 'list' && (
-            <div onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', top: '100%', left: '0', marginTop: '4px', background: 'rgba(238,238,238,0.94)', backdropFilter: 'blur(25px)', borderRadius: '10px', padding: '15px', boxShadow: '0 10px 30px rgba(0,0,0,0.15)', zIndex: 9999, width: '230px', display: 'flex', gap: '6px' }}>
+            <div onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', top: '100%', left: '0', marginTop: '4px', background: 'rgba(238,238,238,0.)', backdropFilter: 'blur(25px)', borderRadius: '10px', padding: '15px', boxShadow: '0 10px 30px rgba(0,0,0,0.15)', zIndex: 9999, width: '230px', display: 'flex', gap: '6px' }}>
               <button onClick={() => insertList('none')} style={{ width: '42px', height: '54px', background: '#d0e1f9', border: 'none', borderRadius: '5px', color: '#0055cc', fontSize: '11px', fontWeight: '500', cursor: 'pointer' }}>None</button>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '25px', flex: 1 }}>
                 {[

@@ -73,7 +73,7 @@ export default function Sidebar({
 
   return (
     <>
-      <aside className="sidebar">
+      <aside className="sidebar" style={{ background: '#ffffff' }}>
         {/* Ligne du haut : point vert + boutons vue */}
         <div className="sidebar-top-row">
           <div className="green-dot" />
@@ -86,7 +86,9 @@ export default function Sidebar({
               overflow: 'hidden',
             }}
           >
-            {/* Fond noir animé qui glisse entre Liste et Grille */}
+            {/* Fond blanc animé qui glisse entre Liste et Grille
+                (couleur alignée sur le blanc de la page, avec une légère
+                ombre pour rester visible sur le fond gris clair de la barre). */}
             <span
               aria-hidden="true"
               style={{
@@ -96,8 +98,8 @@ export default function Sidebar({
                 left: viewMode === 'grid' ? '50%' : '4px',
                 width: 'calc(50% - 4px)',
                 borderRadius: '12px',
-                background: '#757575',
-                boxShadow: '0 2px 5px rgba(164, 164, 164, 0.25)',
+                background: '#ffffff',
+                boxShadow: '0 2px 5px rgba(0, 0, 0, 0.15)',
                 transition: 'left 280ms cubic-bezier(0.22, 1, 0.36, 1)',
                 pointerEvents: 'none',
                 zIndex: 0,
@@ -115,13 +117,13 @@ export default function Sidebar({
                 background: 'transparent',
                 boxShadow: 'none',
                 transition: 'color 180ms ease, transform 180ms ease',
-                color: viewMode === 'list' ? '#ffffff' : '#3f3f46',
+                color: viewMode === 'list' ? '#000000' : '#3f3f46',
                 transform: viewMode === 'list' ? 'scale(1.04)' : 'scale(1)',
               }}
             >
               <i
                 className="fa-solid fa-list"
-                style={{ color: viewMode === 'list' ? '#ffffff' : '#3f3f46' }}
+                style={{ color: viewMode === 'list' ? '#000000' : '#3f3f46' }}
               ></i>
             </button>
             <button
@@ -138,13 +140,13 @@ export default function Sidebar({
                 background: 'transparent',
                 boxShadow: 'none',
                 transition: 'color 180ms ease, transform 180ms ease',
-                color: viewMode === 'grid' ? '#ffffff' : '#3f3f46',
+                color: viewMode === 'grid' ? '#000000' : '#3f3f46',
                 transform: viewMode === 'grid' ? 'scale(1.04)' : 'scale(1)',
               }}
             >
               <i
                 className="fa-solid fa-grip"
-                style={{ color: viewMode === 'grid' ? '#ffffff' : '#3f3f46' }}
+                style={{ color: viewMode === 'grid' ? '#000000' : '#3f3f46' }}
               ></i>
             </button>
           </div>
