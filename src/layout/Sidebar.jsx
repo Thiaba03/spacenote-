@@ -1,4 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { supabase } from '../lib/supabase';
+
+// Dossiers "système" toujours présents, non stockés en base
+const SYSTEM_FOLDERS = [
+  { id: 'all',   label: 'MySpace (All)', isSystem: true },
+  { id: 'notes', label: 'Notes', isSystem: true },
+];
 
 export default function Sidebar({
   notes,
@@ -10,26 +17,75 @@ export default function Sidebar({
   onSignOut,
   isSigningOut,
 }) {
-  const [folders, setFolders] = useState([
-    { id: 'all',   label: 'MySpace (All)' },
-    { id: 'notes', label: 'Notes' },
-  ]);
+  // Dossiers créés par l'utilisateur, chargés depuis Supabase
+  const [customFolders, setCustomFolders] = useState([]);
+  const [foldersLoading, setFoldersLoading] = useState(true);
+  const [foldersError, setFoldersError] = useState('');
+
+  // Liste complète affichée = dossiers système + dossiers Supabase
+  const folders = [...SYSTEM_FOLDERS, ...customFolders];
 
   // États pour la modale "New folder"
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [folderName, setFolderName] = useState('New folder');
   const [isSmartFolder, setIsSmartFolder] = useState(false);
+  const [isSavingFolder, setIsSavingFolder] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   // Gestion des lignes de filtres dynamiques (image_eb9aeb.png, image_eba64e.png)
   const [filterRows, setFilterRows] = useState([
     { id: crypto.randomUUID(), type: 'Filters', contentMode: 'All filters', textValue: '' }
   ]);
 
+  // ── Chargement initial des dossiers depuis Supabase ───────────────────────
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadFolders = async () => {
+      setFoldersLoading(true);
+      setFoldersError('');
+
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) {
+        if (!cancelled) {
+          setCustomFolders([]);
+          setFoldersLoading(false);
+        }
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from('folders')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: true });
+
+      if (cancelled) return;
+
+      if (error) {
+        console.error('Impossible de charger les dossiers :', error);
+        setFoldersError("Impossible de charger vos dossiers.");
+        setCustomFolders([]);
+      } else {
+        setCustomFolders((data || []).map((row) => ({
+          id: row.id,
+          label: row.label,
+          isSmart: row.is_smart,
+          filters: row.filters || [],
+        })));
+      }
+      setFoldersLoading(false);
+    };
+
+    loadFolders();
+    return () => { cancelled = true; };
+  }, []);
+
   const countForFolder = (fid) => {
     if (fid === 'all') return notes.length;
-    const foundFolder = folders.find(f => f.id === fid);
-    if (foundFolder && foundFolder.label === 'New') return 1; // Correspond à la maquette image_eb9f07.png
-    return notes.filter((n) => n.folder === 'Notes').length;
+    if (fid === 'notes') return notes.filter((n) => n.folder === 'Notes').length;
+    // Dossier personnalisé : compte les notes qui lui sont rattachées
+    return notes.filter((n) => n.folderId === fid).length;
   };
 
   // Ajouter une nouvelle ligne de filtre (Bouton +)
@@ -52,16 +108,50 @@ export default function Sidebar({
     setFilterRows(filterRows.map(row => row.id === id ? { ...row, ...fields } : row));
   };
 
-  const handleSaveFolder = () => {
-    if (!folderName.trim()) return;
-    
-    setFolders((prev) => [
-      ...prev, 
-      { 
-        id: folderName.toLowerCase().replace(/\s+/g, '-'), 
-        label: folderName,
-        isSmart: isSmartFolder 
-      }
+  // ── Sauvegarde du nouveau dossier dans Supabase ───────────────────────────
+  const handleSaveFolder = async () => {
+    if (!folderName.trim() || isSavingFolder) return;
+
+    setIsSavingFolder(true);
+    setSaveError('');
+
+    const { data: { user }, error: userError } = await supabase.auth.getUser();
+    if (userError || !user) {
+      setSaveError('Vous devez être connecté pour créer un dossier.');
+      setIsSavingFolder(false);
+      return;
+    }
+
+    const payload = {
+      user_id: user.id,
+      label: folderName.trim(),
+      is_smart: isSmartFolder,
+      filters: isSmartFolder ? filterRows : [],
+    };
+
+    const { data: insertedFolder, error: insertError } = await supabase
+      .from('folders')
+      .insert(payload)
+      .select()
+      .single();
+
+    setIsSavingFolder(false);
+
+    if (insertError) {
+      console.error('Impossible de créer le dossier :', insertError);
+      setSaveError("Le dossier n'a pas pu être créé. Réessayez.");
+      return;
+    }
+
+    // Ajoute le dossier retourné par Supabase (avec son vrai id) à la liste locale
+    setCustomFolders((prev) => [
+      ...prev,
+      {
+        id: insertedFolder.id,
+        label: insertedFolder.label,
+        isSmart: insertedFolder.is_smart,
+        filters: insertedFolder.filters || [],
+      },
     ]);
 
     // Réinitialisation globale après sauvegarde (image_eb9f07.png)
@@ -86,9 +176,6 @@ export default function Sidebar({
               overflow: 'hidden',
             }}
           >
-            {/* Fond blanc animé qui glisse entre Liste et Grille
-                (couleur alignée sur le blanc de la page, avec une légère
-                ombre pour rester visible sur le fond gris clair de la barre). */}
             <span
               aria-hidden="true"
               style={{
@@ -164,21 +251,32 @@ export default function Sidebar({
         {/* Section MySpace */}
         <div className="sidebar-section">
           <div className="section-title">MySpace</div>
-          <ul className="folder-list" id="folder-list">
-            {folders.map((f) => (
-              <li
-                key={f.id}
-                className={selectedFolder === f.id ? 'active' : ''}
-                onClick={() => setSelectedFolder(f.id)}
-              >
-                <span className="folder-item-left">
-                  <i className={f.isSmart ? "fa-solid fa-gear" : "fa-regular fa-folder"}></i>
-                  <span>{f.label}</span>
-                </span>
-                <span className="folder-count">{countForFolder(f.id)}</span>
-              </li>
-            ))}
-          </ul>
+          {foldersLoading ? (
+            <div style={{ fontSize: '12px', color: '#999', padding: '8px 12px' }}>
+              Chargement des dossiers…
+            </div>
+          ) : (
+            <ul className="folder-list" id="folder-list">
+              {folders.map((f) => (
+                <li
+                  key={f.id}
+                  className={selectedFolder === f.id ? 'active' : ''}
+                  onClick={() => setSelectedFolder(f.id)}
+                >
+                  <span className="folder-item-left">
+                    <i className={f.isSmart ? "fa-solid fa-gear" : "fa-regular fa-folder"}></i>
+                    <span>{f.label}</span>
+                  </span>
+                  <span className="folder-count">{countForFolder(f.id)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {foldersError && (
+            <div style={{ fontSize: '12px', color: '#dc2626', padding: '4px 12px' }}>
+              {foldersError}
+            </div>
+          )}
         </div>
 
         {/* Déconnexion */}
@@ -252,7 +350,7 @@ export default function Sidebar({
               </div>
             </div>
 
-            {/* SECTION MULTI-FILTRES DYNAMIQUES (CORRIGÉE VISUELLEMENT) */}
+            {/* SECTION MULTI-FILTRES DYNAMIQUES */}
             {isSmartFolder && (
               <div style={{ borderTop: '1px solid #e5e5e5', paddingTop: '14px', marginBottom: '20px' }}>
                 <p style={{ fontSize: '13px', fontWeight: '600', margin: '0 0 12px 0', color: '#000' }}>
@@ -270,8 +368,6 @@ export default function Sidebar({
                       width: '100%'
                     }}
                   >
-                    
-                    {/* Premier sélecteur (Type principal) */}
                     <select 
                       value={row.type}
                       onChange={(e) => updateFilterRow(row.id, { type: e.target.value })}
@@ -289,7 +385,6 @@ export default function Sidebar({
                       <option value="Notes with Lists">Notes with Lists</option>
                     </select>
 
-                    {/* Deuxième sélecteur adaptatif (image_eb9b81.png) */}
                     <select 
                       value={row.contentMode}
                       onChange={(e) => updateFilterRow(row.id, { contentMode: e.target.value })}
@@ -317,7 +412,6 @@ export default function Sidebar({
                       )}
                     </select>
 
-                    {/* Input text OU Espaceur invisible pour stabiliser la position des boutons */}
                     {row.type === 'Filters' ? (
                       <input 
                         type="text"
@@ -332,7 +426,6 @@ export default function Sidebar({
                       <div style={{ flex: 1 }} />
                     )}
 
-                    {/* Groupe de boutons d'action aligné et figé à droite */}
                     <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
                       <button 
                         onClick={() => removeFilterRow(row.id)}
@@ -361,6 +454,12 @@ export default function Sidebar({
               </div>
             )}
 
+            {saveError && (
+              <div style={{ fontSize: '12px', color: '#dc2626', marginBottom: '12px' }}>
+                {saveError}
+              </div>
+            )}
+
             {/* Boutons d'action bas de modale */}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '20px' }}>
               <button 
@@ -374,14 +473,17 @@ export default function Sidebar({
               </button>
               <button 
                 onClick={handleSaveFolder}
+                disabled={isSavingFolder}
                 style={{
                   padding: '6px 20px', borderRadius: '8px', border: 'none',
                   background: 'linear-gradient(to bottom, #a1c4fd 0%, #c2e9fb 100%)', 
-                  color: '#fff', fontSize: '13px', fontWeight: '600', cursor: 'pointer',
+                  color: '#fff', fontSize: '13px', fontWeight: '600',
+                  cursor: isSavingFolder ? 'default' : 'pointer',
+                  opacity: isSavingFolder ? 0.7 : 1,
                   boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
                 }}
               >
-                Save
+                {isSavingFolder ? 'Saving…' : 'Save'}
               </button>
             </div>
 
