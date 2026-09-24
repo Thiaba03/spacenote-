@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase';
 import bas1 from './bas1.png';
 import bas2 from './bas2.png';
 import bas3 from './bas3.png';
+import SharedNotesInbox from './SharedNotesInbox';
 
 const LINK_SUGGESTIONS = [
   {
@@ -140,10 +141,12 @@ export default function NoteEditor({
   const [showLockPassword, setShowLockPassword] = useState(false);
   const [linkInput, setLinkInput]     = useState('');
   const [linkError, setLinkError]     = useState('');
-  const [listTypesByNote, setListTypesByNote] = useState({});
+  const [listTypesByCard, setListTypesByCard] = useState({});
   const [mediaModal, setMediaModal]   = useState(false);
   const [mediaTab, setMediaTab]       = useState('photos');
   const [selectedImg, setSelectedImg] = useState(null);
+  // Carte/slide actuellement ciblée pour les médias : 0 = première carte.
+  const [activeCardIndex, setActiveCardIndex] = useState(0);
   const [mediaSearch, setMediaSearch] = useState('');
   const [mediaAssets, setMediaAssets] = useState([]);
   const [mediaLoading, setMediaLoading] = useState(false);
@@ -191,20 +194,193 @@ export default function NoteEditor({
   const [isRenameModalOpen, setIsRenameModalOpen] = useState(false);
   const [tempTitle, setTempTitle] = useState('');
 
+  // ── Partage Supabase ──────────────────────────────────────────────────────
+  const [shareProfiles, setShareProfiles] = useState([]);
+  const [shareProfilesLoading, setShareProfilesLoading] = useState(false);
+  const [shareRecipientId, setShareRecipientId] = useState(null);
+  const [shareMode, setShareMode] = useState('copy');
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareError, setShareError] = useState('');
+  const [shareSuccess, setShareSuccess] = useState('');
+  const [showSharedInbox, setShowSharedInbox] = useState(false);
+
+  const loadShareProfiles = async () => {
+    setShareProfilesLoading(true);
+    setShareError('');
+    const { data: { user }, error: userError } = await supabase.auth.getUser();
+    if (userError || !user) {
+      setShareProfiles([]);
+      setShareProfilesLoading(false);
+      setShareError('Vous devez être connecté pour partager une note.');
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, display_name, avatar_url')
+      .neq('id', user.id)
+      .order('display_name', { ascending: true });
+
+    if (error) {
+      console.error('Impossible de charger les contacts :', error);
+      setShareProfiles([]);
+      setShareError(`Impossible de charger les contacts : ${error.message}`);
+    } else {
+      setShareProfiles(data || []);
+    }
+    setShareProfilesLoading(false);
+  };
+
+    const openShareMenu = async () => {
+    const opening = openDD !== 'share';
+
+    if (opening) {
+      const sharedNatively = await shareNoteNative();
+      if (sharedNatively) return; // le panneau natif a été utilisé, pas besoin du menu custom
+    }
+
+    setShareError('');
+    setShareSuccess('');
+    setShareRecipientId(null);
+    if (opening && shareProfiles.length === 0) {
+      await loadShareProfiles();
+    }
+    setOpenDD(opening ? 'share' : null);
+  };
+  
+    const shareNoteNative = async () => {
+    if (!note) return false;
+    if (!navigator.share) return false;
+
+    try {
+      await navigator.share({
+        title: note.title || 'Note sans titre',
+        text: note.content?.replace(/<[^>]*>/g, '').slice(0, 200) || '',
+      });
+      return true;
+    } catch (err) {
+      if (err.name === 'AbortError') return true; // l'utilisateur a annulé, ne pas ouvrir le fallback
+      console.error('Erreur de partage natif :', err);
+      return false;
+    }
+  };
+
+  
+
+  const createNoteShare = async (recipientId, permission = 'editor') => {
+    if (!note || !recipientId || shareBusy) return;
+
+    setShareBusy(true);
+    setShareError('');
+    setShareSuccess('');
+
+    const { data: { user }, error: userError } = await supabase.auth.getUser();
+    if (userError || !user) {
+      setShareError('Vous devez être connecté pour partager une note.');
+      setShareBusy(false);
+      return;
+    }
+
+    if (recipientId === user.id) {
+      setShareError('Vous ne pouvez pas partager la note avec votre propre compte.');
+      setShareBusy(false);
+      return;
+    }
+
+    const { error } = await supabase
+      .from('note_shares')
+      .upsert({
+        note_id: note.id,
+        recipient_id: recipientId,
+        permission,
+        status: 'pending',
+        accepted_at: null,
+      }, { onConflict: 'note_id,recipient_id' });
+
+    if (error) {
+      console.error('Erreur de partage :', error);
+      setShareError(`Le partage n'a pas pu être enregistré : ${error.message}`);
+    } else {
+      const recipient = shareProfiles.find((profile) => profile.id === recipientId);
+      setShareSuccess(`Invitation envoyée à ${recipient?.display_name || 'cet utilisateur'}.`);
+      setShareRecipientId(recipientId);
+    }
+
+    setShareBusy(false);
+  };
+
   const note        = notes.find((n) => n.id === selectedId);
-  const activePal   = note ? (COLOR_PALETTES[note.color] || COLOR_PALETTES['Yellow']) : COLOR_PALETTES['Yellow'];
-  const additionalCards = note && note.cards ? note.cards.slice(1) : [];
-  const currentMainText = note?.cards?.[0]?.text ?? note?.text ?? '';
+
+  // Quand on change de note, on revient toujours sur sa première slide.
+  useEffect(() => {
+    setActiveCardIndex(0);
+  }, [selectedId]);
+  const getCards = (currentNote) => {
+    if (!currentNote) return [];
+    const rawCards = Array.isArray(currentNote.cards) && currentNote.cards.length
+      ? currentNote.cards
+      : [{ id: currentNote.id, subtitle: currentNote.title || 'Untitled', text: currentNote.text || '' }];
+    return rawCards.map((rawCard, index) => ({
+      ...rawCard,
+      subtitle: rawCard.subtitle ?? (index === 0 ? currentNote.title : 'Untitled'),
+      text: rawCard.text ?? (index === 0 ? currentNote.text : ''),
+      format: rawCard.format ?? (index === 0 ? currentNote.format : DEFAULT_TEXT_FORMAT),
+      color: rawCard.color ?? (index === 0 ? currentNote.color : 'Yellow'),
+      images: rawCard.images ?? (index === 0 ? currentNote.images : []),
+      links: rawCard.links ?? (index === 0 ? currentNote.links : []),
+      tables: rawCard.tables ?? (index === 0 ? currentNote.tables : []),
+      isLocked: rawCard.isLocked ?? (index === 0 ? currentNote.isLocked : false),
+      lockPasswordHash: rawCard.lockPasswordHash ?? (index === 0 ? currentNote.lockPasswordHash : undefined),
+      lockPasswordSalt: rawCard.lockPasswordSalt ?? (index === 0 ? currentNote.lockPasswordSalt : undefined),
+    }));
+  };
+
+  const cards = note ? getCards(note) : [];
+  const activeCard = cards[activeCardIndex] || cards[0] || null;
+  const activePal = activeCard ? (COLOR_PALETTES[activeCard.color || note?.color] || COLOR_PALETTES['Yellow']) : COLOR_PALETTES['Yellow'];
+  const additionalCards = cards.slice(1);
+  const currentMainText = activeCard?.text ?? '';
   const firstMainLine = currentMainText.split('\n')[0] || '';
   const detectedListType = Object.entries(LIST_PREFIXES).find(([type, prefix]) => (
     type === 'num' ? /^\d+\.\s/.test(firstMainLine) : firstMainLine.startsWith(prefix)
   ))?.[0] || null;
-  const activeListType = Object.prototype.hasOwnProperty.call(listTypesByNote, selectedId)
-    ? listTypesByNote[selectedId]
+  const listStateKey = `${selectedId}:${activeCardIndex}`;
+  const activeListType = Object.prototype.hasOwnProperty.call(listTypesByCard, listStateKey)
+    ? listTypesByCard[listStateKey]
     : detectedListType;
   const setActiveListType = (value) => {
-    setListTypesByNote((previousTypes) => ({ ...previousTypes, [selectedId]: value }));
+    setListTypesByCard((previousTypes) => ({ ...previousTypes, [listStateKey]: value }));
   };
+
+  const updateCardAt = (cardIndex, patch) => {
+    if (!note) return;
+    setNotes((prev) => prev.map((currentNote) => {
+      if (currentNote.id !== selectedId) return currentNote;
+      const currentCards = getCards(currentNote);
+      const index = Math.max(0, Math.min(cardIndex, Math.max(0, currentCards.length - 1)));
+      const nextCards = [...currentCards];
+      nextCards[index] = { ...nextCards[index], ...patch };
+      const updated = { ...currentNote, cards: nextCards };
+      if (index === 0) {
+        Object.assign(updated, {
+          title: nextCards[0].subtitle,
+          text: nextCards[0].text,
+          format: nextCards[0].format,
+          color: nextCards[0].color,
+          images: nextCards[0].images,
+          links: nextCards[0].links,
+          tables: nextCards[0].tables,
+          isLocked: nextCards[0].isLocked,
+          lockPasswordHash: nextCards[0].lockPasswordHash,
+          lockPasswordSalt: nextCards[0].lockPasswordSalt,
+        });
+      }
+      return updated;
+    }));
+  };
+
+  const updateActiveCard = (patch) => updateCardAt(activeCardIndex, patch);
+
 
   // ── Taille adaptative des cartes ─────────────────────────────────────────
   const totalCards = note && note.cards ? note.cards.length : 1;
@@ -223,54 +399,38 @@ export default function NoteEditor({
   const updateNote = (patch) =>
     setNotes((prev) => prev.map((n) => (n.id === selectedId ? { ...n, ...patch } : n)));
 
-  const setColor = (colorName) => { updateNote({ color: colorName }); closeAll(); };
+  const setColor = (colorName) => { updateActiveCard({ color: colorName }); closeAll(); };
 
   // ── Modal renommage ───────────────────────────────────────────────────────
   const openRenameModal = () => {
     if (!note) return;
-    setTempTitle(note.title || '');
+    setTempTitle(activeCard?.subtitle || note.title || '');
     setIsRenameModalOpen(true);
   };
 
   const saveGroupTitle = () => {
-    updateNote({ title: tempTitle || 'Untitled' });
+    updateActiveCard({ subtitle: tempTitle || 'Untitled' });
     setIsRenameModalOpen(false);
   };
 
   // ── Liste ─────────────────────────────────────────────────────────────────
   const updateMainText = (value) => {
-    setNotes((previousNotes) => previousNotes.map((currentNote) => {
-      if (currentNote.id !== selectedId) return currentNote;
-      const updatedCards = [...(currentNote.cards || [])];
-      if (updatedCards[0]) updatedCards[0] = { ...updatedCards[0], text: value };
-      return { ...currentNote, text: value, cards: updatedCards };
-    }));
+    updateActiveCard({ text: value });
   };
 
   const mainTextFormat = {
     ...DEFAULT_TEXT_FORMAT,
-    ...(note?.cards?.[0]?.format || {}),
+    ...(activeCard?.format || {}),
   };
 
   const updateMainTextFormat = (patch) => {
-    setNotes((previousNotes) => previousNotes.map((currentNote) => {
-      if (currentNote.id !== selectedId) return currentNote;
-      const updatedCards = [...(currentNote.cards || [])];
-      const firstCard = updatedCards[0] || {
-        id: crypto.randomUUID(),
-        subtitle: currentNote.title || 'Untitled',
-        text: currentNote.text || '',
-      };
-      updatedCards[0] = {
-        ...firstCard,
-        format: {
-          ...DEFAULT_TEXT_FORMAT,
-          ...(firstCard.format || {}),
-          ...patch,
-        },
-      };
-      return { ...currentNote, cards: updatedCards };
-    }));
+    updateActiveCard({
+      format: {
+        ...DEFAULT_TEXT_FORMAT,
+        ...(activeCard?.format || {}),
+        ...patch,
+      },
+    });
   };
 
   const setTextStyle = (styleName) => {
@@ -288,7 +448,7 @@ export default function NoteEditor({
 
   const disableList = () => {
     if (!note) return;
-    const currentText = note.cards?.[0]?.text ?? note.text ?? '';
+    const currentText = activeCard?.text ?? ''; 
     const textarea = mainTextareaRef.current;
     const selStart = textarea ? textarea.selectionStart : 0;
     const selEnd = textarea ? textarea.selectionEnd : 0;
@@ -309,7 +469,7 @@ export default function NoteEditor({
       return;
     }
 
-    const currentText = note.cards?.[0]?.text ?? note.text ?? '';
+    const currentText = activeCard?.text ?? ''; 
     const textarea = mainTextareaRef.current;
     const selStart = textarea ? textarea.selectionStart : 0;
     const selEnd = textarea ? textarea.selectionEnd : currentText.length;
@@ -392,12 +552,12 @@ export default function NoteEditor({
   const insertTable = (rows, cols) => {
     if (!note) return;
     const newTable = { id: crypto.randomUUID(), rows, cols, data: Array.from({ length: rows }, () => Array(cols).fill('')) };
-    updateNote({ tables: [...(note.tables || []), newTable] });
+    updateActiveCard({ tables: [...(activeCard?.tables || []), newTable] });
     closeAll();
   };
 
-  const updateCell = (tableId, r, c, value) => {
-    const tables = (note.tables || []).map((t) => {
+  const updateCell = (tableId, r, c, value, cardIndex = activeCardIndex) => {
+    const tables = (activeCard?.tables || []).map((t) => {
       if (t.id !== tableId) return t;
       return { ...t, data: t.data.map((row, ri) => ri === r ? row.map((cell, ci) => ci === c ? value : cell) : row) };
     });
@@ -405,19 +565,19 @@ export default function NoteEditor({
   };
 
   const tableAddColBefore = (tableId, colIdx) => {
-    const tables = (note.tables || []).map((t) => t.id !== tableId ? t : { ...t, cols: t.cols + 1, data: t.data.map((row) => [...row.slice(0, colIdx), '', ...row.slice(colIdx)]) });
+    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : { ...t, cols: t.cols + 1, data: t.data.map((row) => [...row.slice(0, colIdx), '', ...row.slice(colIdx)]) });
     updateNote({ tables }); setTableCtxMenu(null);
   };
   const tableAddColAfter = (tableId, colIdx) => {
-    const tables = (note.tables || []).map((t) => t.id !== tableId ? t : { ...t, cols: t.cols + 1, data: t.data.map((row) => [...row.slice(0, colIdx + 1), '', ...row.slice(colIdx + 1)]) });
+    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : { ...t, cols: t.cols + 1, data: t.data.map((row) => [...row.slice(0, colIdx + 1), '', ...row.slice(colIdx + 1)]) });
     updateNote({ tables }); setTableCtxMenu(null);
   };
   const tableDeleteCol = (tableId, colIdx) => {
-    const tables = (note.tables || []).map((t) => (t.id !== tableId || t.cols <= 1) ? t : { ...t, cols: t.cols - 1, data: t.data.map((row) => row.filter((_, ci) => ci !== colIdx)) });
+    const tables = (activeCard?.tables || []).map((t) => (t.id !== tableId || t.cols <= 1) ? t : { ...t, cols: t.cols - 1, data: t.data.map((row) => row.filter((_, ci) => ci !== colIdx)) });
     updateNote({ tables }); setTableCtxMenu(null);
   };
   const tableAddRowBefore = (tableId, rowIdx) => {
-    const tables = (note.tables || []).map((t) => t.id !== tableId ? t : {
+    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : {
       ...t,
       rows: t.rows + 1,
       data: [...t.data.slice(0, rowIdx), Array(t.cols).fill(''), ...t.data.slice(rowIdx)],
@@ -425,7 +585,7 @@ export default function NoteEditor({
     updateNote({ tables }); setTableCtxMenu(null);
   };
   const tableAddRowAfter = (tableId, rowIdx) => {
-    const tables = (note.tables || []).map((t) => t.id !== tableId ? t : {
+    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : {
       ...t,
       rows: t.rows + 1,
       data: [...t.data.slice(0, rowIdx + 1), Array(t.cols).fill(''), ...t.data.slice(rowIdx + 1)],
@@ -433,7 +593,7 @@ export default function NoteEditor({
     updateNote({ tables }); setTableCtxMenu(null);
   };
   const tableDeleteRow = (tableId, rowIdx) => {
-    const tables = (note.tables || []).map((t) => (t.id !== tableId || t.rows <= 1) ? t : {
+    const tables = (activeCard?.tables || []).map((t) => (t.id !== tableId || t.rows <= 1) ? t : {
       ...t,
       rows: t.rows - 1,
       data: t.data.filter((_, index) => index !== rowIdx),
@@ -506,11 +666,17 @@ export default function NoteEditor({
 
   const insertSelectedImg = () => {
     if (!selectedImg || !note) return;
-    updateNote({ images: [...(note.images || []), {
-      id: crypto.randomUUID(), assetId: selectedImg.id, name: selectedImg.name,
-      path: selectedImg.path, mime_type: selectedImg.mime_type, src: selectedImg.src,
-    }] });
-    setMediaModal(false); setSelectedImg(null);
+    const media = {
+      id: crypto.randomUUID(),
+      assetId: selectedImg.id,
+      name: selectedImg.name,
+      path: selectedImg.path,
+      mime_type: selectedImg.mime_type,
+      src: selectedImg.src,
+    };
+    updateActiveCard({ images: [...(activeCard?.images || []), media] });
+    setMediaModal(false);
+    setSelectedImg(null);
   };
 
   // ── Lien ──────────────────────────────────────────────────────────────────
@@ -554,7 +720,7 @@ export default function NoteEditor({
       return;
     }
 
-    const linkAlreadyExists = (note.links || []).some(
+    const linkAlreadyExists = (activeCard?.links || []).some(
       (existingLink) => normalizeUrl(existingLink.url) === normalizedUrl
     );
     if (linkAlreadyExists) {
@@ -562,9 +728,11 @@ export default function NoteEditor({
       return;
     }
 
-    updateNote({
+    // Le lien doit être enregistré sur la slide actuellement sélectionnée,
+    // exactement comme les images, tableaux, couleurs et autres éléments.
+    updateActiveCard({
       links: [
-        ...(note.links || []),
+        ...(activeCard?.links || []),
         { ...link, id: crypto.randomUUID(), url: normalizedUrl },
       ],
     });
@@ -596,23 +764,37 @@ export default function NoteEditor({
 
   // ── Cartes groupe ─────────────────────────────────────────────────────────
   const addGroupCard = () => {
-    setNotes((prev) =>
-      prev.map((n) =>
-        n.id === selectedId
-          ? { ...n, cards: [...(n.cards || [{ id: n.id, subtitle: n.title, text: n.text }]), { id: crypto.randomUUID(), subtitle: 'Untitled', text: '' }] }
-          : n
-      )
-    );
+    setNotes((prev) => prev.map((n) => {
+      if (n.id !== selectedId) return n;
+      const currentCards = getCards(n);
+      const inheritedColor = currentCards[activeCardIndex]?.color || currentCards[0]?.color || n.color || 'Yellow';
+      const inheritedFormat = { ...(currentCards[activeCardIndex]?.format || DEFAULT_TEXT_FORMAT) };
+      return {
+        ...n,
+        cards: [...currentCards, {
+          id: crypto.randomUUID(),
+          subtitle: 'Untitled',
+          text: '',
+          format: inheritedFormat,
+          color: inheritedColor,
+          images: [],
+          links: [],
+          tables: [],
+          isLocked: false,
+        }],
+      };
+    }));
   };
 
   const removeLastGroupCard = () => {
-    setNotes((prev) =>
-      prev.map((n) =>
-        n.id === selectedId && n.cards && n.cards.length > 1
-          ? { ...n, cards: n.cards.slice(0, -1) }
-          : n
-      )
-    );
+    setNotes((prev) => prev.map((n) => {
+      if (n.id !== selectedId) return n;
+      const currentCards = getCards(n);
+      if (currentCards.length <= 1) return n;
+      const nextCards = currentCards.slice(0, -1);
+      return { ...n, cards: nextCards };
+    }));
+    setActiveCardIndex((index) => Math.max(0, index - 1));
   };
 
   // ── Lock ──────────────────────────────────────────────────────────────────
@@ -621,11 +803,11 @@ export default function NoteEditor({
     setLockError('');
     setShowLockPassword(false);
 
-    if (note?.isLocked) {
+    if (activeCard?.isLocked) {
       setLockMode('unlock');
       setLockStep('password-input');
-    } else if (note?.lockPasswordHash && note?.lockPasswordSalt) {
-      updateNote({ isLocked: true });
+    } else if (activeCard?.lockPasswordHash && activeCard?.lockPasswordSalt) {
+      updateActiveCard({ isLocked: true });
       setLockStep(null);
     } else {
       setLockStep('options');
@@ -634,27 +816,25 @@ export default function NoteEditor({
   };
 
   const handleLockNote = async () => {
-    if (!note || lockBusy) return;
+    if (!note || !activeCard || lockBusy) return;
     if (password.length < 6) {
       setLockError('Le mot de passe doit contenir au moins 6 caractères.');
       return;
     }
-
     setLockBusy(true);
     setLockError('');
-
     try {
-      if (note.isLocked || lockMode === 'unlock') {
-        if (!note.lockPasswordHash || !note.lockPasswordSalt) {
-          setLockError('Cette ancienne note ne possède pas encore de mot de passe sécurisé.');
+      if (activeCard.isLocked || lockMode === 'unlock') {
+        if (!activeCard.lockPasswordHash || !activeCard.lockPasswordSalt) {
+          setLockError('Cette slide ne possède pas encore de mot de passe sécurisé.');
           return;
         }
-        const candidateHash = await derivePasswordHash(password, note.lockPasswordSalt);
-        if (!hashesMatch(candidateHash, note.lockPasswordHash)) {
+        const candidateHash = await derivePasswordHash(password, activeCard.lockPasswordSalt);
+        if (!hashesMatch(candidateHash, activeCard.lockPasswordHash)) {
           setLockError('Mot de passe incorrect.');
           return;
         }
-        updateNote({ isLocked: false });
+        updateActiveCard({ isLocked: false });
       } else {
         if (lockMode === 'session') {
           const { data: userData, error: userError } = await supabase.auth.getUser();
@@ -663,25 +843,16 @@ export default function NoteEditor({
             setLockError('Impossible de vérifier votre session.');
             return;
           }
-          const { error: sessionPasswordError } = await supabase.auth.signInWithPassword({
-            email,
-            password,
-          });
+          const { error: sessionPasswordError } = await supabase.auth.signInWithPassword({ email, password });
           if (sessionPasswordError) {
             setLockError('Le mot de passe de session est incorrect.');
             return;
           }
         }
-
         const salt = createPasswordSalt();
         const passwordHash = await derivePasswordHash(password, salt);
-        updateNote({
-          isLocked: true,
-          lockPasswordHash: passwordHash,
-          lockPasswordSalt: salt,
-        });
+        updateActiveCard({ isLocked: true, lockPasswordHash: passwordHash, lockPasswordSalt: salt });
       }
-
       setLockStep(null);
       setPassword('');
       setShowLockPassword(false);
@@ -695,11 +866,21 @@ export default function NoteEditor({
   };
 
   const handleCloseAllLockedNotes = () => {
-    setNotes((previousNotes) => previousNotes.map((currentNote) => (
-      currentNote.lockPasswordHash && currentNote.lockPasswordSalt
-        ? { ...currentNote, isLocked: true }
-        : currentNote
-    )));
+    setNotes((previousNotes) => previousNotes.map((currentNote) => {
+      const currentCards = getCards(currentNote);
+      const lockedCards = currentCards.map((card) => (
+        card.lockPasswordHash && card.lockPasswordSalt ? { ...card, isLocked: true } : card
+      ));
+      const updated = { ...currentNote, cards: lockedCards };
+      if (lockedCards[0]) {
+        Object.assign(updated, {
+          isLocked: lockedCards[0].isLocked,
+          lockPasswordHash: lockedCards[0].lockPasswordHash,
+          lockPasswordSalt: lockedCards[0].lockPasswordSalt,
+        });
+      }
+      return updated;
+    }));
     closeAll();
   };
 
@@ -714,237 +895,183 @@ export default function NoteEditor({
     }} />
   );
 
+  const buildMailtoUrl = (currentNote) => {
+    if (!currentNote) return '#';
 
-  // ── Rendu note principale ─────────────────────────────────────────────────
-  const renderMainStickyNote = () => {
-    if (!note) return null;
-    const pal = activePal;
-    const mainText = note.cards && note.cards[0] ? note.cards[0].text : note.text;
+    const cards = getCards(currentNote);
+    const body = cards
+      .map((card) => {
+        const title = card.subtitle || 'Untitled';
+        const text = card.text || '';
+        const tables = (card.tables || [])
+          .map((table) => (table.data || []).map((row) => (row || []).join(' | ')).join('\n'))
+          .filter(Boolean)
+          .join('\n\n');
 
-    return (
-      <div className="sticky-note" style={{ background: pal.body, width: CARD_WIDTH, height: CARD_MIN_HEIGHT, maxHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: '0 3px 8px rgba(0,0,0,0.12)', display: 'flex', flexDirection: 'column', overflow: 'hidden', clipPath: 'none' }}>
-        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 0 auto' }}>
-          {note.isLocked ? '🔒 Contenu Protégé' : note.title}
-        </div>
-        <div
-          className="sticky-body sticky-body-scroll"
-          style={{ padding: '18px 20px', flex: 1, display: 'flex', flexDirection: 'column', ...SCROLLABLE_BODY_STYLE }}
-        >
-          {note.isLocked ? (
-            <div className="lock-masked-screen">
-              <i className="fa-solid fa-lock lock-masked-icon"></i>
-              <p className="lock-masked-text">Cette note est protégée.</p>
-              <button className="btn-lock-yellow" style={{ width: 'auto', padding: '8px 20px', marginTop: '10px' }} onClick={() => { setLockMode('unlock'); setPassword(''); setLockError(''); setLockStep('password-input'); }}>
-                Saisir le mot de passe
+        return [
+          cards.length > 1 ? `--- ${title} ---` : '',
+          text,
+          tables,
+        ].filter(Boolean).join('\n');
+      })
+      .filter(Boolean)
+      .join('\n\n');
+
+    return `mailto:?subject=${encodeURIComponent(currentNote.title || 'Note')}&body=${encodeURIComponent(body)}`;
+  };
+
+  const sendNoteByMail = (event) => {
+    // Le navigateur doit effectuer lui-même la navigation mailto:
+    // via un vrai <a href="mailto:...">. On ne remplace donc pas
+    // window.location et on ne crée pas de lien caché en JavaScript.
+    if (!note) {
+      event?.preventDefault();
+      return;
+    }
+    closeAll();
+  };
+
+
+
+  
+
+  // ── Rendu des tableaux d'une slide ───────────────────────────────────────
+  const renderCardTables = (card, globalIdx) => {
+    const pal = COLOR_PALETTES[card?.color] || COLOR_PALETTES['Yellow'];
+    return (card?.tables || []).map((tbl) => (
+      <div key={tbl.id} className="note-table-wrapper" style={{ position: 'relative', margin: '4px 0 12px', padding: '20px 0 0 20px', flexShrink: 0 }}>
+        {Array.from({ length: tbl.cols }).map((_, ci) => {
+          const isActive = tableCtxMenu?.tableId === tbl.id && tableCtxMenu?.type === 'column' && tableCtxMenu?.index === ci && tableCtxMenu?.cardIndex === globalIdx;
+          return (
+            <button key={`column-${ci}`} type="button" className="col-handle" aria-label={`Options de la colonne ${ci + 1}`}
+              onClick={(e) => { e.stopPropagation(); setTableCtxMenu({ tableId: tbl.id, type: 'column', index: ci, cardIndex: globalIdx }); }}
+              style={{ position: 'absolute', top: 0, left: `calc(20px + ${(ci / tbl.cols) * 100}% - ${(ci / tbl.cols) * 20}px)`, width: `calc(${100 / tbl.cols}% - ${20 / tbl.cols}px)`, height: '20px', padding: 0, border: 'none', borderRadius: '5px 5px 0 0', background: isActive ? '#ffb800' : 'transparent', color: isActive ? '#fff' : '#b8b8b8', cursor: 'pointer', fontSize: '15px', lineHeight: 1 }}>
+              •••
+            </button>
+          );
+        })}
+        {Array.from({ length: tbl.rows }).map((_, ri) => {
+          const isActive = tableCtxMenu?.tableId === tbl.id && tableCtxMenu?.type === 'row' && tableCtxMenu?.index === ri && tableCtxMenu?.cardIndex === globalIdx;
+          return (
+            <button key={`row-${ri}`} type="button" className="row-handle" aria-label={`Options de la ligne ${ri + 1}`}
+              onClick={(e) => { e.stopPropagation(); setTableCtxMenu({ tableId: tbl.id, type: 'row', index: ri, cardIndex: globalIdx }); }}
+              style={{ position: 'absolute', left: 0, top: `calc(20px + ${(ri / tbl.rows) * 100}% - ${(ri / tbl.rows) * 20}px)`, width: '20px', height: `calc(${100 / tbl.rows}% - ${20 / tbl.rows}px)`, padding: 0, border: 'none', borderRadius: '5px 0 0 5px', background: isActive ? '#ffb800' : 'transparent', color: isActive ? '#fff' : '#b8b8b8', cursor: 'pointer', fontSize: '14px', lineHeight: 0.55, writingMode: 'vertical-rl' }}>
+              •••
+            </button>
+          );
+        })}
+        <table className="note-table" style={{ borderCollapse: 'collapse', width: '100%', tableLayout: 'fixed' }}>
+          <tbody>
+            {tbl.data.map((row, ri) => (
+              <tr key={ri}>
+                {row.map((cell, ci) => (
+                  <td key={ci} style={{ border: '1px solid #a9a9a9', padding: '2px', height: '54px' }}>
+                    <input value={cell} onChange={(e) => updateCell(tbl.id, ri, ci, e.target.value, globalIdx)} onFocus={() => { setActiveCardIndex(globalIdx); setTableCtxMenu(null); }}
+                      style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', outline: 'none', fontSize: '13px', padding: '7px', color: pal.darkText, boxSizing: 'border-box' }} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {tableCtxMenu?.tableId === tbl.id && tableCtxMenu?.cardIndex === globalIdx && (
+          <div className="table-ctx-menu" onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', zIndex: 999, minWidth: '170px', overflow: 'hidden', top: tableCtxMenu.type === 'column' ? '20px' : `calc(20px + ${(tableCtxMenu.index / tbl.rows) * 100}%)`, left: tableCtxMenu.type === 'column' ? `calc(20px + ${(tableCtxMenu.index / tbl.cols) * 100}%)` : '-150px', background: 'rgba(238,238,238,0.98)', border: '1px solid #dedede', borderRadius: '8px', boxShadow: '0 5px 18px rgba(0,0,0,.18)' }}>
+            {(tableCtxMenu.type === 'column' ? [
+              { label: 'Insert a front column', action: () => tableAddColBefore(tbl.id, tableCtxMenu.index) },
+              { label: 'Insert column after', action: () => tableAddColAfter(tbl.id, tableCtxMenu.index) },
+              { label: 'Delete column', action: () => tableDeleteCol(tbl.id, tableCtxMenu.index), destructive: true },
+            ] : [
+              { label: 'Insert a row above', action: () => tableAddRowBefore(tbl.id, tableCtxMenu.index) },
+              { label: 'Insert a row below', action: () => tableAddRowAfter(tbl.id, tableCtxMenu.index) },
+              { label: 'Delete row', action: () => tableDeleteRow(tbl.id, tableCtxMenu.index), destructive: true },
+            ]).map(({ label, action, destructive }, optionIndex) => (
+              <button key={label} onClick={action} style={{ display: 'block', width: '100%', padding: '9px 14px', textAlign: 'left', background: 'none', border: 'none', borderTop: optionIndex === 2 ? '1px solid #c9c9c9' : 'none', cursor: 'pointer', fontSize: '13px', color: destructive ? '#111' : '#111' }}>
+                {label}
               </button>
-            </div>
-          ) : (
-            <>
-              {(note.images || []).map((media) => (
-                <div key={media.id} className="note-image-block" style={{ flexShrink: 0, flexGrow: 0, width: '100%' }}>
-                  {media.mime_type?.startsWith('video/') ? (
-                    <video src={media.src} controls playsInline preload="metadata"
-                      style={{ width: '100%', height: '260px', maxHeight: '260px', objectFit: 'contain', borderRadius: '6px', display: 'block' }} />
-                  ) : (
-                    <img src={media.src} alt={media.name} style={{ width: '100%', height: '260px', maxHeight: '260px', objectFit: 'contain', borderRadius: '6px', display: 'block' }} />
-                  )}
-                  <button className="note-image-remove" onClick={() => updateNote({ images: (note.images || []).filter((i) => i.id !== media.id) })}>✕</button>
+            ))}
+          </div>
+        )}
+      </div>
+    ));
+  };
+
+  // ── Rendu d'une slide ─────────────────────────────────────────────────────
+  const renderCardBody = (card, globalIdx, { isMain = false } = {}) => {
+    if (!card) return null;
+    const pal = COLOR_PALETTES[card.color] || COLOR_PALETTES['Yellow'];
+    const format = { ...DEFAULT_TEXT_FORMAT, ...(card.format || {}) };
+    const text = card.text || '';
+    const images = card.images || [];
+    const links = card.links || [];
+    const isLocked = !!card.isLocked;
+    return (
+      <div className="sticky-body sticky-body-scroll" style={{ padding: '18px 20px', flex: 1, display: 'flex', flexDirection: 'column', ...SCROLLABLE_BODY_STYLE }}>
+        {isLocked ? (
+          <div className="lock-masked-screen">
+            <i className="fa-solid fa-lock lock-masked-icon"></i>
+            <p className="lock-masked-text">Cette slide est protégée.</p>
+            <button className="btn-lock-yellow" style={{ width: 'auto', padding: '8px 20px', marginTop: '10px' }} onClick={(e) => { e.stopPropagation(); setActiveCardIndex(globalIdx); setLockMode('unlock'); setPassword(''); setLockError(''); setLockStep('password-input'); }}>
+              Saisir le mot de passe
+            </button>
+          </div>
+        ) : (
+          <>
+            {images.map((media) => (
+              <div key={media.id} className="note-image-block" style={{ flexShrink: 0, flexGrow: 0, width: '100%', position: 'relative', marginBottom: '10px' }}>
+                {media.mime_type?.startsWith('video/') ? (
+                  <video src={media.src} controls playsInline preload="metadata" style={{ width: '100%', height: isMain ? '260px' : '180px', maxHeight: isMain ? '260px' : '180px', objectFit: 'contain', borderRadius: '6px', display: 'block' }} />
+                ) : (
+                  <img src={media.src} alt={media.name} style={{ width: '100%', height: isMain ? '260px' : '180px', maxHeight: isMain ? '260px' : '180px', objectFit: 'contain', borderRadius: '6px', display: 'block' }} />
+                )}
+                <button className="note-image-remove" onClick={(e) => { e.stopPropagation(); updateCardAt(globalIdx, { images: (card.images || []).filter((i) => i.id !== media.id) }); }}>✕</button>
+              </div>
+            ))}
+            {links.map((lnk) => (
+              <div key={lnk.id} className="link-preview-card" style={{ flexShrink: 0 }}>
+                {lnk.thumbnail && <div className="link-preview-thumb"><img src={lnk.thumbnail} alt={lnk.title} />{lnk.type === 'youtube' && <div className="link-preview-play"><i className="fa-solid fa-play"></i></div>}</div>}
+                <div className="link-preview-info">
+                  <a href={normalizeUrl(lnk.url) || '#'} target="_blank" rel="noopener noreferrer" title="Ouvrir le lien dans un nouvel onglet" style={{ color: 'inherit', textDecoration: 'none', display: 'block' }}>
+                    <div className="link-preview-desc">{lnk.description}</div><div className="link-preview-site">{lnk.siteName}</div>
+                  </a>
                 </div>
-              ))}
-              {(note.links || []).map((lnk) => (
-                <div key={lnk.id} className="link-preview-card" style={{ flexShrink: 0 }}>
-                  {lnk.thumbnail && (
-                    <div className="link-preview-thumb">
-                      <img src={lnk.thumbnail} alt={lnk.title} />
-                      {lnk.type === 'youtube' && <div className="link-preview-play"><i className="fa-solid fa-play"></i></div>}
-                    </div>
-                  )}
-                  <div className="link-preview-info">
-                    <a
-                      href={normalizeUrl(lnk.url) || '#'}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      title="Ouvrir le lien dans un nouvel onglet"
-                      style={{ color: 'inherit', textDecoration: 'none', display: 'block' }}
-                    >
-                      <div className="link-preview-desc">{lnk.description}</div>
-                      <div className="link-preview-site">{lnk.siteName}</div>
-                    </a>
-                  </div>
-                  <div className="link-preview-bar" style={{ background: pal.header }} />
-                  <button className="link-preview-remove" onClick={() => updateNote({ links: (note.links || []).filter((l) => l.id !== lnk.id) })}>✕</button>
-                </div>
-              ))}
-              <textarea
-                value={mainText || ''}
-                placeholder="Start a note..."
-                style={{
-                  color: mainTextFormat.color || pal.darkText,
-                  width: '100%',
-                  minHeight: (note.tables || []).length > 0 ? '80px' : '120px',
-                  flex: '0 0 auto',
-                  flexShrink: 0,
-                  overflow: 'hidden',
-                  background: mainTextFormat.backgroundColor || 'transparent',
-                  border: 'none',
-                  borderLeft: mainTextFormat.style === 'quote' ? '3px solid #ff9500' : 'none',
-                  outline: 'none',
-                  resize: 'none',
-                  paddingLeft: mainTextFormat.style === 'quote' ? '12px' : '0',
-                  fontSize: `${mainTextFormat.fontSize}px`,
-                  lineHeight: 1.6,
-                  fontFamily: mainTextFormat.fontFamily,
-                  fontWeight: mainTextFormat.bold ? '700' : '400',
-                  fontStyle: mainTextFormat.italic ? 'italic' : 'normal',
-                  textDecoration: [
-                    mainTextFormat.underline ? 'underline' : '',
-                    mainTextFormat.strike ? 'line-through' : '',
-                  ].filter(Boolean).join(' ') || 'none',
-                  textAlign: mainTextFormat.align,
-                }}
-                onChange={(e) => updateMainText(e.target.value)}
-                onInput={(e) => {
-                  e.target.style.height = 'auto';
-                  e.target.style.height = `${e.target.scrollHeight}px`;
-                }}
-                ref={(el) => {
-                  mainTextareaRef.current = el;
-                  if (el) {
-                    el.style.height = 'auto';
-                    el.style.height = `${el.scrollHeight}px`;
-                  }
-                }}
-                onKeyDown={handleListKeyDown}
-              />
-              {(note.tables || []).map((tbl) => (
-                <div key={tbl.id} className="note-table-wrapper" style={{ position: 'relative', order: -1, margin: '4px 0 12px', padding: '20px 0 0 20px', flexShrink: 0 }}>
-                  {Array.from({ length: tbl.cols }).map((_, ci) => {
-                    const isActive = tableCtxMenu?.tableId === tbl.id && tableCtxMenu?.type === 'column' && tableCtxMenu?.index === ci;
-                    return (
-                      <button
-                        key={`column-${ci}`}
-                        type="button"
-                        className="col-handle"
-                        aria-label={`Options de la colonne ${ci + 1}`}
-                        onClick={(e) => { e.stopPropagation(); setTableCtxMenu({ tableId: tbl.id, type: 'column', index: ci }); }}
-                        style={{
-                          position: 'absolute', top: 0,
-                          left: `calc(20px + ${(ci / tbl.cols) * 100}% - ${(ci / tbl.cols) * 20}px)`,
-                          width: `calc(${100 / tbl.cols}% - ${20 / tbl.cols}px)`, height: '20px',
-                          padding: 0, border: 'none', borderRadius: '5px 5px 0 0',
-                          background: isActive ? '#ffb800' : 'transparent', color: isActive ? '#fff' : '#b8b8b8',
-                          cursor: 'pointer', fontSize: '15px', lineHeight: 1,
-                        }}
-                      >•••</button>
-                    );
-                  })}
-                  {Array.from({ length: tbl.rows }).map((_, ri) => {
-                    const isActive = tableCtxMenu?.tableId === tbl.id && tableCtxMenu?.type === 'row' && tableCtxMenu?.index === ri;
-                    return (
-                      <button
-                        key={`row-${ri}`}
-                        type="button"
-                        className="row-handle"
-                        aria-label={`Options de la ligne ${ri + 1}`}
-                        onClick={(e) => { e.stopPropagation(); setTableCtxMenu({ tableId: tbl.id, type: 'row', index: ri }); }}
-                        style={{
-                          position: 'absolute', left: 0,
-                          top: `calc(20px + ${(ri / tbl.rows) * 100}% - ${(ri / tbl.rows) * 20}px)`,
-                          width: '20px', height: `calc(${100 / tbl.rows}% - ${20 / tbl.rows}px)`,
-                          padding: 0, border: 'none', borderRadius: '5px 0 0 5px',
-                          background: isActive ? '#ffb800' : 'transparent', color: isActive ? '#fff' : '#b8b8b8',
-                          cursor: 'pointer', fontSize: '14px', lineHeight: 0.55,
-                          writingMode: 'vertical-rl',
-                        }}
-                      >•••</button>
-                    );
-                  })}
-                  <table className="note-table" style={{ borderCollapse: 'collapse', width: '100%', tableLayout: 'fixed' }}>
-                    <tbody>
-                      {tbl.data.map((row, ri) => (
-                        <tr key={ri}>
-                          {row.map((cell, ci) => (
-                            <td key={ci} style={{ border: '1px solid #a9a9a9', padding: '2px', height: '54px' }}>
-                              <input value={cell} onChange={(e) => updateCell(tbl.id, ri, ci, e.target.value)}
-                                onFocus={() => setTableCtxMenu(null)}
-                                style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', outline: 'none', fontSize: '13px', padding: '7px', color: pal.darkText, boxSizing: 'border-box' }} />
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  {tableCtxMenu?.tableId === tbl.id && (
-                    <div className="table-ctx-menu" onClick={(e) => e.stopPropagation()}
-                      style={{
-                        position: 'absolute', zIndex: 999, minWidth: '170px', overflow: 'hidden',
-                        top: tableCtxMenu.type === 'column' ? '20px' : `calc(20px + ${(tableCtxMenu.index / tbl.rows) * 100}%)`,
-                        left: tableCtxMenu.type === 'column' ? `calc(20px + ${(tableCtxMenu.index / tbl.cols) * 100}%)` : '-150px',
-                        background: 'rgba(238,238,238,0.98)', border: '1px solid #dedede', borderRadius: '8px',
-                        boxShadow: '0 5px 18px rgba(0,0,0,.18)',
-                      }}>
-                      {(tableCtxMenu.type === 'column' ? [
-                        { label: 'Insert a front column', action: () => tableAddColBefore(tbl.id, tableCtxMenu.index) },
-                        { label: 'Insert column after', action: () => tableAddColAfter(tbl.id, tableCtxMenu.index) },
-                        { label: 'Delete column', action: () => tableDeleteCol(tbl.id, tableCtxMenu.index), destructive: true },
-                      ] : [
-                        { label: 'Insert a row above', action: () => tableAddRowBefore(tbl.id, tableCtxMenu.index) },
-                        { label: 'Insert a row below', action: () => tableAddRowAfter(tbl.id, tableCtxMenu.index) },
-                        { label: 'Delete row', action: () => tableDeleteRow(tbl.id, tableCtxMenu.index), destructive: true },
-                      ]).map(({ label, action, destructive }, optionIndex) => (
-                        <button key={label} onClick={action}
-                          style={{ display: 'block', width: '100%', padding: '9px 14px', textAlign: 'left', background: 'none', border: 'none', borderTop: optionIndex === 2 ? '1px solid #c9c9c9' : 'none', cursor: 'pointer', fontSize: '13px', color: destructive ? '#111' : '#111' }}
-                          onMouseEnter={(e) => e.currentTarget.style.background = '#f5f5f5'}
-                          onMouseLeave={(e) => e.currentTarget.style.background = 'none'}>
-                          {label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </>
-          )}
-        </div>
+                <div className="link-preview-bar" style={{ background: pal.header }} />
+                <button className="link-preview-remove" onClick={(e) => { e.stopPropagation(); updateCardAt(globalIdx, { links: (card.links || []).filter((l) => l.id !== lnk.id) }); }}>✕</button>
+              </div>
+            ))}
+            <textarea value={text} placeholder="Start a note..." style={{ color: format.color || pal.darkText, width: '100%', minHeight: (card.tables || []).length > 0 ? '80px' : '120px', flex: '0 0 auto', overflow: 'hidden', background: format.backgroundColor || 'transparent', border: 'none', borderLeft: format.style === 'quote' ? '3px solid #ff9500' : 'none', outline: 'none', resize: 'none', paddingLeft: format.style === 'quote' ? '12px' : '0', fontSize: `${format.fontSize}px`, lineHeight: 1.6, fontFamily: format.fontFamily, fontWeight: format.bold ? '700' : '400', fontStyle: format.italic ? 'italic' : 'normal', textDecoration: [format.underline ? 'underline' : '', format.strike ? 'line-through' : ''].filter(Boolean).join(' ') || 'none', textAlign: format.align }}
+              onFocus={() => setActiveCardIndex(globalIdx)}
+              onChange={(e) => { setActiveCardIndex(globalIdx); updateActiveCard({ text: e.target.value }); }}
+              onInput={(e) => { e.target.style.height = 'auto'; e.target.style.height = `${e.target.scrollHeight}px`; }}
+              ref={(el) => { if (el && globalIdx === activeCardIndex) { mainTextareaRef.current = el; el.style.height = 'auto'; el.style.height = `${el.scrollHeight}px`; } }}
+              onKeyDown={handleListKeyDown}
+            />
+            {renderCardTables(card, globalIdx)}
+          </>
+        )}
+      </div>
+    );
+  };
+
+  const renderMainStickyNote = () => {
+    if (!note || !cards[0]) return null;
+    const card = cards[0];
+    const pal = COLOR_PALETTES[card.color] || COLOR_PALETTES['Yellow'];
+    return (
+      <div className="sticky-note" onClick={() => setActiveCardIndex(0)} style={{ background: pal.body, width: CARD_WIDTH, height: CARD_MIN_HEIGHT, maxHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: 'none', display: 'flex', flexDirection: 'column', overflow: 'hidden', clipPath: 'none', outline: 'none' }}>
+        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 0 auto' }}>{card.isLocked ? '🔒 Contenu Protégé' : (card.subtitle || 'Untitled')}</div>
+        {renderCardBody(card, 0, { isMain: true })}
         <FoldedCorner />
       </div>
     );
   };
 
-  
-  // ── Rendu carte supplémentaire ────────────────────────────────────────────
   const renderGroupCard = (card, subIdx) => {
-    const pal = activePal;
     const globalIdx = subIdx + 1;
+    const pal = COLOR_PALETTES[card.color] || COLOR_PALETTES['Yellow'];
     return (
-      <div key={card.id} className="sticky-note" style={{ background: pal.body, width: CARD_WIDTH, height: CARD_MIN_HEIGHT, maxHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: '0 3px 8px rgba(0,0,0,0.12)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 0 auto' }}>
-          {card.subtitle || 'Untitled'}
-        </div>
-        <div className="sticky-body sticky-body-scroll" style={{ padding: '18px 20px', flex: 1, ...SCROLLABLE_BODY_STYLE }}>
-          <textarea
-            value={card.text || ''}
-            placeholder="Start a note..."
-            style={{ color: pal.darkText, width: '100%', minHeight: '120px', flexShrink: 0, overflow: 'hidden', background: 'transparent', border: 'none', outline: 'none', resize: 'none', fontSize: '15px', lineHeight: 1.6, fontFamily: 'inherit' }}
-            onInput={(e) => {
-              e.target.style.height = 'auto';
-              e.target.style.height = `${e.target.scrollHeight}px`;
-            }}
-            ref={(el) => {
-              if (el) {
-                el.style.height = 'auto';
-                el.style.height = `${el.scrollHeight}px`;
-              }
-            }}
-            onChange={(e) => {
-              setNotes((prev) => prev.map((n) => {
-                if (n.id !== selectedId) return n;
-                const updatedCards = (n.cards || []).map((c, i) => i === globalIdx ? { ...c, text: e.target.value } : c);
-                return { ...n, cards: updatedCards };
-              }));
-            }}
-          />
-        </div>
+      <div key={card.id} className="sticky-note" onClick={() => setActiveCardIndex(globalIdx)} style={{ background: pal.body, width: CARD_WIDTH, height: CARD_MIN_HEIGHT, maxHeight: CARD_MIN_HEIGHT, flex: '0 0 auto', position: 'relative', borderRadius: '6px', boxShadow: 'none', display: 'flex', flexDirection: 'column', overflow: 'hidden', outline: activeCardIndex === globalIdx ? '2px solid #007AFF' : 'none', outlineOffset: '2px' }}>
+        <div className="sticky-header-bar" style={{ background: pal.header, color: pal.text, fontWeight: 800, fontSize: '20px', padding: '22px 20px', textAlign: 'center', borderBottom: '2px solid rgba(0,0,0,0.12)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 0 auto' }}>{card.isLocked ? '🔒 Contenu Protégé' : (card.subtitle || 'Untitled')}</div>
+        {renderCardBody(card, globalIdx)}
         <FoldedCorner />
       </div>
     );
@@ -1013,7 +1140,7 @@ export default function NoteEditor({
                   <li key={name} className="color-item" onClick={(e) => { e.stopPropagation(); setColor(name); }}>
                     <span className="color-square" style={{ background: pal.header }} />
                     <span className="color-name">{name}</span>
-                    {note?.color === name && <i className="fa-solid fa-check check-icon" style={{ color: '#007AFF' }}></i>}
+                    {activeCard?.color === name && <i className="fa-solid fa-check check-icon" style={{ color: '#007AFF' }}></i>}
                   </li>
                 ))}
               </ul>
@@ -1150,13 +1277,13 @@ export default function NoteEditor({
       insertTable(2, 2);
     }}
     title={
-      note?.tables?.length > 0
+      activeCard?.tables?.length > 0
         ? 'Add another table'
         : 'Add a table'
     }
     style={{
       background:
-        note?.tables?.length > 0
+        activeCard?.tables?.length > 0
           ? '#dcdcdc'
           : 'transparent',
       borderRadius: '5px',
@@ -1277,18 +1404,18 @@ export default function NoteEditor({
   onClick={() => toggle('lock')}
   title="Verrouiller"
   className={`toolbar-light-icon ${
-    openDD === 'lock' || note?.isLocked ? 'active' : ''
+    openDD === 'lock' || activeCard?.isLocked ? 'active' : ''
   }`}
 >
   <i
     className={`fa-solid ${
-      note?.isLocked ? 'fa-lock' : 'fa-lock-open'
+      activeCard?.isLocked ? 'fa-lock' : 'fa-lock-open'
     }`}
   ></i>
 </button>
           {openDD === 'lock' && (
             <div className="lock-dropdown">
-              <button className="lock-item" onClick={handleLockToggleAction}>{note?.isLocked ? 'Unlock this note' : 'Lock this note'}</button>
+              <button className="lock-item" onClick={handleLockToggleAction}>{activeCard?.isLocked ? 'Unlock this slide' : 'Lock this slide'}</button>
               <button className="lock-item" onClick={handleCloseAllLockedNotes}>Close all locked notes</button>
             </div>
           )}
@@ -1297,7 +1424,7 @@ export default function NoteEditor({
         {/* ── PARTAGER ── */}
         <div className="rel">
           <button
-  onClick={() => toggle('share')}
+  onClick={(e) => { e.stopPropagation(); openShareMenu(); }}
   title="Partager"
   className={`toolbar-light-icon ${openDD === 'share' ? 'active' : ''}`}
 >
@@ -1315,23 +1442,103 @@ export default function NoteEditor({
                   <p>{note?.folder || 'Notes'}</p>
                 </div>
               </div>
+
               <div className="share-select-container">
-                <select className="share-action-select"><option>Send a copy</option><option>Collaborate</option></select>
+                <select
+                  className="share-action-select"
+                  value={shareMode}
+                  onChange={(e) => { setShareMode(e.target.value); setShareError(''); setShareSuccess(''); }}
+                >
+                  <option value="copy">Send a copy</option>
+                  <option value="collaborate">Collaborate</option>
+                </select>
               </div>
+
               <div className="share-section-title">SpaceChat / GhostLabs Contacts</div>
-              <div className="share-contacts-row">
-                {[{ name: 'Moses', cls: 'avatar-yellow' }, { name: 'Adam', cls: 'avatar-green' }, { name: 'Kahina', cls: 'avatar-purple' }].map(({ name, cls }) => (
-                  <div key={name} className="contact-item" onClick={closeAll}>
-                    <div className={`contact-avatar ${cls}`}><i className="fa-solid fa-user"></i></div>
-                    <span>{name}</span>
-                  </div>
-                ))}
-              </div>
+
+              {shareProfilesLoading ? (
+                <div style={{ padding: '12px 4px', fontSize: '12px', color: '#777', textAlign: 'center' }}>Loading contacts...</div>
+              ) : shareProfiles.length === 0 ? (
+                <div style={{ padding: '12px 4px', fontSize: '12px', color: '#777', textAlign: 'center' }}>No other users found.</div>
+              ) : (
+                <div className="share-contacts-row">
+                  {shareProfiles.map((profile, profileIndex) => {
+                    const displayName = profile.display_name || `User ${profileIndex + 1}`;
+                    const initials = displayName
+                      .split(/\s+/)
+                      .filter(Boolean)
+                      .slice(0, 2)
+                      .map((part) => part[0].toUpperCase())
+                      .join('');
+                    const isSelected = shareRecipientId === profile.id;
+                    return (
+                      <button
+                        key={profile.id}
+                        type="button"
+                        className="contact-item"
+                        onClick={() => {
+                          if (shareMode === 'collaborate') {
+                            createNoteShare(profile.id, 'editor');
+                          } else {
+                            setShareError('Send a copy sera branché après la duplication complète de la note.');
+                          }
+                        }}
+                        disabled={shareBusy}
+                        title={shareMode === 'collaborate' ? `Collaborer avec ${displayName}` : `Envoyer une copie à ${displayName}`}
+                        style={{ border: 'none', background: 'transparent', cursor: shareBusy ? 'wait' : 'pointer', padding: 0, opacity: shareBusy && !isSelected ? 0.6 : 1 }}
+                      >
+                        <div
+                          className="contact-avatar"
+                          style={profile.avatar_url ? { backgroundImage: `url(${profile.avatar_url})`, backgroundSize: 'cover', backgroundPosition: 'center' } : undefined}
+                        >
+                          {profile.avatar_url ? null : initials || <i className="fa-solid fa-user"></i>}
+                        </div>
+                        <span>{displayName}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {shareError && (
+                <div role="alert" style={{ color: '#d93025', fontSize: '12px', padding: '8px 4px 2px' }}>
+                  {shareError}
+                </div>
+              )}
+
+              {shareSuccess && (
+                <div role="status" style={{ color: '#188038', fontSize: '12px', padding: '8px 4px 2px' }}>
+                  {shareSuccess}
+                </div>
+              )}
+
               <div className="share-divider"></div>
-              <div className="share-app-row" onClick={closeAll}>
-                <div className="app-icon-mail"><i className="fa-solid fa-envelope"></i></div>
-                <span className="app-label">Mail</span>
-              </div>
+
+              <a
+  className="share-app-row"
+  href={buildMailtoUrl(note)}
+  onClick={sendNoteByMail}
+  title="Envoyer une copie de la note par e-mail"
+  style={{
+    display: 'flex',
+    alignItems: 'center',
+    textDecoration: 'none',
+    color: 'inherit',
+    width: '100%',
+    cursor: 'pointer'
+  }}
+>
+  <div className="app-icon-mail">
+    <i className="fa-solid fa-envelope"></i>
+  </div>
+
+  <span className="app-label">Mail</span>
+</a>
+
+           
+
+
+              
             </div>
           )}
         </div>
@@ -1386,9 +1593,19 @@ export default function NoteEditor({
                     { ic: 'fa-pen-ruler', t: 'Notes with drawings' }, { ic: 'fa-expand', t: 'Notes with scanned documents' },
                     { ic: 'fa-paperclip', t: 'Notes with attachments' },
                   ].map(({ ic, t }, idx) => (
-                    <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '13px', color: '#000', cursor: 'pointer', padding: '3px 4px', borderRadius: '6px' }}
+                    <div
+                      key={idx}
+                      style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '13px', color: '#000', cursor: 'pointer', padding: '3px 4px', borderRadius: '6px' }}
+                      onClick={() => {
+                        if (t === 'Shared notes') {
+                          setSearchOpen(false);
+                          setMediaSearch('');
+                          setShowSharedInbox(true);
+                        }
+                      }}
                       onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(0,0,0,0.05)'}
-                      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}>
+                      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                    >
                       <i className={`fa-solid ${ic}`} style={{ width: '18px', textAlign: 'center', color: '#444' }}></i>
                       <span>{t}</span>
                     </div>
@@ -1420,9 +1637,10 @@ export default function NoteEditor({
         {note && note.cards && note.cards.length > 0 && (
           <input
             type="text"
-            value={note.title || ''}
+            value={activeCard?.subtitle || ''}
             placeholder="Add a title..."
-            onChange={(e) => updateNote({ title: e.target.value })}
+            onFocus={() => setActiveCardIndex(activeCardIndex)}
+            onChange={(e) => updateActiveCard({ subtitle: e.target.value })}
             style={{
               flex: 1,
               maxWidth: '400px',
@@ -1605,6 +1823,54 @@ export default function NoteEditor({
         </div>
       )}
 
+      {showSharedInbox && (
+        <div
+          className="modal-overlay"
+          onClick={() => setShowSharedInbox(false)}
+          style={{ zIndex: 12000, padding: '24px', boxSizing: 'border-box', overflowY: 'auto' }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: '100%', maxWidth: '680px', position: 'relative' }}
+          >
+            <button
+              type="button"
+              onClick={() => setShowSharedInbox(false)}
+              aria-label="Fermer les notes partagées"
+              style={{
+                position: 'absolute',
+                right: '14px',
+                top: '14px',
+                zIndex: 2,
+                width: '32px',
+                height: '32px',
+                borderRadius: '50%',
+                border: '1px solid #ddd',
+                background: '#fff',
+                color: '#111',
+                cursor: 'pointer',
+                fontSize: '16px',
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+
+            <SharedNotesInbox
+              onOpenNote={(sharedNote) => {
+                setNotes((previousNotes) => {
+                  const exists = previousNotes.some((currentNote) => currentNote.id === sharedNote.id);
+                  if (exists) return previousNotes;
+                  return [sharedNote, ...previousNotes];
+                });
+                setShowSharedInbox(false);
+              }}
+              onClose={() => setShowSharedInbox(false)}
+            />
+          </div>
+        </div>
+      )}
+
       {/* ═══ TUNNEL LOCK ═════════════════════════════════════════════════ */}
       {lockStep && (
         <div className="modal-overlay" onClick={() => setLockStep(null)}>
@@ -1643,11 +1909,11 @@ export default function NoteEditor({
               <div className="lock-icon-circle"><i className="fa-solid fa-lock"></i></div>
               <h2 style={{ marginBottom: '5px' }}>SpaceNotes</h2>
               <p style={{ color: '#666', fontSize: '13px', marginBottom: '22px' }}>
-                {note?.isLocked || lockMode === 'unlock'
-                  ? 'Saisissez le mot de passe pour déverrouiller cette note.'
+                {activeCard?.isLocked || lockMode === 'unlock'
+                  ? 'Saisissez le mot de passe pour déverrouiller cette slide.'
                   : lockMode === 'session'
-                    ? 'Confirmez votre mot de passe de connexion pour verrouiller cette note.'
-                    : 'Créez un mot de passe distinct pour verrouiller cette note.'}
+                    ? 'Confirmez votre mot de passe de connexion pour verrouiller cette slide.'
+                    : 'Créez un mot de passe distinct pour verrouiller cette slide.'}
               </p>
               <div style={{ position: 'relative', width: '100%' }}>
                 <input
@@ -1671,7 +1937,7 @@ export default function NoteEditor({
               </div>
               {lockError && <div role="alert" style={{ color: '#dc2626', fontSize: '13px', margin: '-8px 0 16px' }}>{lockError}</div>}
               <div className="lock-modal-actions">
-                <button className="btn-lock-cancel" onClick={() => setLockStep(note?.isLocked ? null : 'options')}>Annuler</button>
+                <button className="btn-lock-cancel" onClick={() => setLockStep(activeCard?.isLocked ? null : 'options')}>Annuler</button>
                 <button className="btn-lock-yellow" style={{ flex: 1, margin: 0 }} onClick={handleLockNote} disabled={lockBusy}>
                   {lockBusy ? 'Vérification…' : 'Confirmer'}
                 </button>
