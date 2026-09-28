@@ -198,7 +198,7 @@ export default function NoteEditor({
   const [shareProfiles, setShareProfiles] = useState([]);
   const [shareProfilesLoading, setShareProfilesLoading] = useState(false);
   const [shareRecipientId, setShareRecipientId] = useState(null);
-  const [shareMode, setShareMode] = useState('copy');
+  const [shareMode, setShareMode] = useState('collaborate');
   const [shareBusy, setShareBusy] = useState(false);
   const [shareError, setShareError] = useState('');
   const [shareSuccess, setShareSuccess] = useState('');
@@ -231,33 +231,8 @@ export default function NoteEditor({
     setShareProfilesLoading(false);
   };
 
-  // Tente d'ouvrir le panneau de partage natif du système (Web Share API).
-  // Retourne true si le panneau natif a été utilisé (ou annulé par l'utilisateur).
-  const shareNoteNative = async () => {
-    if (!note) return false;
-    if (!navigator.share) return false;
-
-    try {
-      await navigator.share({
-        title: note.title || 'Note sans titre',
-        text: (note.text || '').slice(0, 500),
-      });
-      return true;
-    } catch (err) {
-      if (err.name === 'AbortError') return true; // l'utilisateur a annulé : pas de menu de secours
-      console.error('Erreur de partage natif :', err);
-      return false;
-    }
-  };
-
   const openShareMenu = async () => {
     const opening = openDD !== 'share';
-
-    if (opening) {
-      const sharedNatively = await shareNoteNative();
-      if (sharedNatively) return; // panneau natif utilisé, pas besoin du menu custom
-    }
-
     setShareError('');
     setShareSuccess('');
     setShareRecipientId(null);
