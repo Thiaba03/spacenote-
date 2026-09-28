@@ -129,10 +129,14 @@ const SCROLLABLE_BODY_STYLE = {
 };
 
 export default function NoteEditor({
-  notes, setNotes, selectedId,
+  notes,
+  setNotes,
+  selectedId,
+  setSelectedId,
 }) {
   const [openDD, setOpenDD]           = useState(null);
   const [searchOpen, setSearchOpen]   = useState(false);
+  const [noteSearch, setNoteSearch] = useState('');
   const [lockStep, setLockStep]       = useState(null);
   const [password, setPassword]       = useState('');
   const [lockMode, setLockMode]       = useState('custom');
@@ -151,6 +155,22 @@ export default function NoteEditor({
   const [mediaAssets, setMediaAssets] = useState([]);
   const [mediaLoading, setMediaLoading] = useState(false);
   const [tableCtxMenu, setTableCtxMenu] = useState(null);
+  const normalizedNoteSearch = noteSearch.trim().toLowerCase();
+
+  const noteSearchResults = normalizedNoteSearch
+    ? (notes || []).filter((note) => {
+        const searchableText = [
+          note.title,
+          note.text,
+          note.folder,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+
+        return searchableText.includes(normalizedNoteSearch);
+      })
+    : [];
   const fileInputRef = useRef(null);
   const mainTextareaRef = useRef(null);
 
@@ -1537,44 +1557,197 @@ export default function NoteEditor({
           {searchOpen && (
             <div onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', top: '50%', left: '0', transform: 'translateY(-50%)', zIndex: 10000 }}>
               <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-                <input type="text" placeholder="Search" autoFocus value={mediaSearch} onChange={(e) => setMediaSearch(e.target.value)}
-                  style={{ width: '240px', height: '26px', background: 'rgba(235,235,235,0.6)', border: '1.5px solid #ff9500', borderRadius: '6px', padding: '0 28px 0 10px', fontSize: '13px', outline: 'none' }} />
-                <div style={{ position: 'absolute', right: '8px', cursor: 'pointer' }} onClick={() => setSearchOpen(false)}>
-                  <i className="fa-solid fa-magnifying-glass" style={{ fontSize: '13px', color: '#777' }}></i>
-                </div>
-              </div>
-              {!mediaSearch.trim() && (
-                <div style={{ position: 'absolute', top: '100%', right: '0', marginTop: '6px', background: 'rgba(225,225,225,0.94)', backdropFilter: 'blur(25px)', borderRadius: '16px', padding: '14px', boxShadow: '0 10px 30px rgba(0,0,0,0.15)', zIndex: 9999, width: '270px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  <div style={{ fontSize: '12px', fontWeight: '600', color: '#666', paddingLeft: '4px' }}>Research suggestions</div>
-                  {[
-                    { ic: 'fa-user-group', t: 'Shared notes' }, { ic: 'fa-lock', t: 'Locked Notes' },
-                    { ic: 'fa-list-ul', t: 'Notes with lists' }, { ic: 'fa-hashtag', t: 'Notes with tags' },
-                    { ic: 'fa-pen-ruler', t: 'Notes with drawings' }, { ic: 'fa-expand', t: 'Notes with scanned documents' },
-                    { ic: 'fa-paperclip', t: 'Notes with attachments' },
-                  ].map(({ ic, t }, idx) => (
-                    <div
-                      key={idx}
-                      style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '13px', color: '#000', cursor: 'pointer', padding: '3px 4px', borderRadius: '6px' }}
-                      onClick={() => {
-                        if (t === 'Shared notes') {
-                          setSearchOpen(false);
-                          setMediaSearch('');
-                          setShowSharedInbox(true);
-                        }
-                      }}
-                      onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(0,0,0,0.05)'}
-                      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
-                    >
-                      <i className={`fa-solid ${ic}`} style={{ width: '18px', textAlign: 'center', color: '#444' }}></i>
-                      <span>{t}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+                <input
+  type="text"
+  placeholder="Search"
+  autoFocus
+  value={noteSearch}
+  onChange={(e) => setNoteSearch(e.target.value)}
+  style={{
+    width: '240px',
+    height: '26px',
+    background: 'rgba(235,235,235,0.6)',
+    border: '1.5px solid #ff9500',
+    borderRadius: '6px',
+    padding: '0 28px 0 10px',
+    fontSize: '13px',
+    outline: 'none',
+  }}
+/>
+
+<div
+  style={{ position: 'absolute', right: '8px', cursor: 'pointer' }}
+  onClick={() => {
+    setSearchOpen(false);
+    setNoteSearch('');
+  }}
+>
+  <i
+    className="fa-solid fa-magnifying-glass"
+    style={{ fontSize: '13px', color: '#777' }}
+  ></i>
+</div>
+</div>
+
+{noteSearch.trim() ? (
+  <div
+    style={{
+      position: 'absolute',
+      top: '100%',
+      right: '0',
+      marginTop: '6px',
+      background: 'rgba(245,245,245,0.98)',
+      backdropFilter: 'blur(25px)',
+      borderRadius: '12px',
+      padding: '10px',
+      boxShadow: '0 10px 30px rgba(0,0,0,0.15)',
+      zIndex: 9999,
+      width: '270px',
+      maxHeight: '320px',
+      overflowY: 'auto',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '4px',
+    }}
+  >
+    <div
+      style={{
+        fontSize: '12px',
+        fontWeight: '600',
+        color: '#666',
+        padding: '4px 6px 8px',
+      }}
+    >
+      {noteSearchResults.length} résultat(s)
+    </div>
+
+    {noteSearchResults.length > 0 ? (
+      noteSearchResults.map((result) => (
+        <div
+          key={result.id}
+          onClick={() => {
+            setSelectedId(result.id);
+            setSearchOpen(false);
+            setNoteSearch('');
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = 'rgba(0,0,0,0.07)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = 'transparent';
+          }}
+          style={{
+            cursor: 'pointer',
+            padding: '9px 8px',
+            borderRadius: '7px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px',
+          }}
+        >
+          <span style={{ fontSize: '13px', fontWeight: '600', color: '#222' }}>
+            {result.title || 'Untitled'}
+          </span>
+
+          <span
+            style={{
+              fontSize: '11px',
+              color: '#777',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {result.text || result.folder || 'Note'}
+          </span>
         </div>
+      ))
+    ) : (
+      <div style={{ fontSize: '13px', color: '#777', padding: '8px' }}>
+        Aucune note trouvée.
+      </div>
+    )}
+  </div>
+) : (
+  <div
+    style={{
+      position: 'absolute',
+      top: '100%',
+      right: '0',
+      marginTop: '6px',
+      background: 'rgba(225,225,225,0.94)',
+      backdropFilter: 'blur(25px)',
+      borderRadius: '16px',
+      padding: '14px',
+      boxShadow: '0 10px 30px rgba(0,0,0,0.15)',
+      zIndex: 9999,
+      width: '270px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '10px',
+    }}
+  >
+    <div
+      style={{
+        fontSize: '12px',
+        fontWeight: '600',
+        color: '#666',
+        paddingLeft: '4px',
+      }}
+    >
+      Research suggestions
+    </div>
+
+    {[
+      { ic: 'fa-user-group', t: 'Shared notes' },
+      { ic: 'fa-lock', t: 'Locked Notes' },
+      { ic: 'fa-list-ul', t: 'Notes with lists' },
+      { ic: 'fa-hashtag', t: 'Notes with tags' },
+      { ic: 'fa-pen-ruler', t: 'Notes with drawings' },
+      { ic: 'fa-expand', t: 'Notes with scanned documents' },
+      { ic: 'fa-paperclip', t: 'Notes with attachments' },
+    ].map(({ ic, t }, idx) => (
+      <div
+        key={idx}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px',
+          fontSize: '13px',
+          color: '#000',
+          cursor: 'pointer',
+          padding: '3px 4px',
+          borderRadius: '6px',
+        }}
+        onClick={() => {
+          if (t === 'Shared notes') {
+            setSearchOpen(false);
+            setNoteSearch('');
+            setShowSharedInbox(true);
+          }
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.background = 'rgba(0,0,0,0.05)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = 'transparent';
+        }}
+      >
+        <i
+          className={`fa-solid ${ic}`}
+          style={{ width: '18px', textAlign: 'center', color: '#444' }}
+        ></i>
+        <span>{t}</span>
+      </div>
+    ))}
+  </div>
+)}
+       
+    
+          </div>
+        )}
         </div>
+      </div>
       </div>
       {/* ═══ FIN TOOLBAR ══════════════════════════════════════════════════ */}
 
