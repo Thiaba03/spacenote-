@@ -952,16 +952,253 @@ export default function NoteEditor({
     return `mailto:?subject=${encodeURIComponent(currentNote.title || 'Note')}&body=${encodeURIComponent(body)}`;
   };
 
-  const sendNoteByMail = (event) => {
-    // Le navigateur doit effectuer lui-même la navigation mailto:
-    // via un vrai <a href="mailto:...">. On ne remplace donc pas
-    // window.location et on ne crée pas de lien caché en JavaScript.
-    if (!note) {
-      event?.preventDefault();
+  const sendNoteByMail = async (event) => {
+  event?.preventDefault();
+
+  if (!note) {
+    return;
+  }
+
+  try {
+    const noteCards = getCards(note);
+
+    /*
+     * Construction du contenu HTML complet de la note
+     */
+    const html = noteCards
+      .map((card, cardIndex) => {
+        const title = card.subtitle || `Note ${cardIndex + 1}`;
+        const text = card.text || '';
+
+        /*
+         * TEXTE
+         */
+        const textHtml = text
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/\n/g, '<br />');
+
+        /*
+         * LIENS
+         *
+         * On récupère les liens présents dans la carte.
+         * Selon ta structure actuelle, ils peuvent être dans
+         * card.links.
+         */
+        const linksHtml = Array.isArray(card.links)
+          ? card.links
+              .map((link) => {
+                const url =
+                  typeof link === 'string'
+                    ? link
+                    : link?.url || link?.href || link?.src;
+
+                const label =
+                  typeof link === 'string'
+                    ? link
+                    : link?.title || link?.label || url;
+
+                if (!url) return '';
+
+                return `
+                  <p style="margin:8px 0;">
+                    <a
+                      href="${url}"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style="color:#2563eb;text-decoration:underline;"
+                    >
+                      ${label}
+                    </a>
+                  </p>
+                `;
+              })
+              .filter(Boolean)
+              .join('')
+          : '';
+
+        /*
+         * IMAGES
+         */
+        const imagesHtml = Array.isArray(card.images)
+          ? card.images
+              .map((image) => {
+                const src =
+                  image?.src ||
+                  image?.url ||
+                  image?.signedUrl;
+
+                if (!src) return '';
+
+                const alt =
+                  image?.alt ||
+                  image?.title ||
+                  'Image de la note';
+
+                return `
+                  <div style="margin:15px 0;">
+                    <img
+                      src="${src}"
+                      alt="${alt}"
+                      style="
+                        max-width:100%;
+                        height:auto;
+                        display:block;
+                        border-radius:8px;
+                      "
+                    />
+                  </div>
+                `;
+              })
+              .filter(Boolean)
+              .join('')
+          : '';
+
+        /*
+         * TABLEAUX
+         */
+        const tablesHtml = Array.isArray(card.tables)
+          ? card.tables
+              .map((table) => {
+                if (!Array.isArray(table.data)) {
+                  return '';
+                }
+
+                const rowsHtml = table.data
+                  .map((row, rowIndex) => {
+                    if (!Array.isArray(row)) {
+                      return '';
+                    }
+
+                    const cellsHtml = row
+                      .map((cell) => {
+                        const value =
+                          cell === null || cell === undefined
+                            ? ''
+                            : String(cell);
+
+                        return `
+                          <td style="
+                            border:1px solid #d1d5db;
+                            padding:8px 10px;
+                            text-align:left;
+                            vertical-align:top;
+                          ">
+                            ${value
+                              .replace(/&/g, '&amp;')
+                              .replace(/</g, '&lt;')
+                              .replace(/>/g, '&gt;')
+                              .replace(/\n/g, '<br />')}
+                          </td>
+                        `;
+                      })
+                      .join('');
+
+                    return `
+                      <tr>
+                        ${cellsHtml}
+                      </tr>
+                    `;
+                  })
+                  .join('');
+
+                return `
+                  <div style="margin:20px 0;">
+                    <table style="
+                      width:100%;
+                      border-collapse:collapse;
+                      font-family:Arial,sans-serif;
+                      font-size:14px;
+                    ">
+                      <tbody>
+                        ${rowsHtml}
+                      </tbody>
+                    </table>
+                  </div>
+                `;
+              })
+              .filter(Boolean)
+              .join('')
+          : '';
+
+        return `
+          <section style="
+            margin-bottom:30px;
+            font-family:Arial,sans-serif;
+          ">
+
+            ${
+              noteCards.length > 1
+                ? `
+                  <h2 style="
+                    font-size:20px;
+                    margin:0 0 15px;
+                    color:#222;
+                  ">
+                    ${title}
+                  </h2>
+                `
+                : ''
+            }
+
+            ${
+              textHtml
+                ? `
+                  <div style="
+                    font-size:15px;
+                    line-height:1.6;
+                    color:#333;
+                    margin-bottom:15px;
+                  ">
+                    ${textHtml}
+                  </div>
+                `
+                : ''
+            }
+
+            ${imagesHtml}
+
+            ${linksHtml}
+
+            ${tablesHtml}
+
+          </section>
+        `;
+      })
+      .join('');
+
+    /*
+     * Envoi vers Supabase Edge Function
+     */
+    const { data, error } = await supabase.functions.invoke(
+      'send-note-email',
+      {
+        body: {
+          subject: note.title || 'Note SpaceNote',
+          html,
+          noteId: note.id,
+        },
+      }
+    );
+
+    if (error) {
+      console.error('Erreur lors de l’envoi du mail :', error);
+      alert("Impossible d'envoyer la note par e-mail.");
       return;
     }
+
+    console.log('E-mail envoyé :', data);
+
+    alert('La note a été envoyée par e-mail.');
+
     closeAll();
-  };
+
+  } catch (error) {
+    console.error('Erreur lors de la préparation de l’e-mail :', error);
+    alert("Une erreur est survenue lors de l'envoi.");
+  }
+};
 
   // ── Rendu des tableaux d'une slide ───────────────────────────────────────
   const renderCardTables = (card, globalIdx) => {
@@ -1499,25 +1736,31 @@ export default function NoteEditor({
 
               <div className="share-divider"></div>
 
-              <a
-                className="share-app-row"
-                href={buildMailtoUrl(note)}
-                onClick={sendNoteByMail}
-                title="Envoyer une copie de la note par e-mail"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  textDecoration: 'none',
-                  color: 'inherit',
-                  width: '100%',
-                  cursor: 'pointer',
-                }}
-              >
-                <div className="app-icon-mail">
-                  <i className="fa-solid fa-envelope"></i>
-                </div>
-                <span className="app-label">Mail</span>
-              </a>
+              <button
+  type="button"
+  className="share-app-row"
+  onClick={sendNoteByMail}
+  title="Envoyer une copie de la note par e-mail"
+  style={{
+    display: 'flex',
+    alignItems: 'center',
+    textDecoration: 'none',
+    color: 'inherit',
+    width: '100%',
+    cursor: 'pointer',
+    border: 'none',
+    background: 'transparent',
+    padding: 0,
+  }}
+>
+  <div className="app-icon-mail">
+    <i className="fa-solid fa-envelope"></i>
+  </div>
+
+  <span className="app-label">Mail</span>
+</button>
+
+             
             </div>
           )}
         </div>
