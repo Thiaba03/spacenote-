@@ -231,12 +231,31 @@ export default function NoteEditor({
     setShareProfilesLoading(false);
   };
 
-    const openShareMenu = async () => {
+  // Tente d'ouvrir le panneau de partage natif du système (Web Share API).
+  // Retourne true si le panneau natif a été utilisé (ou annulé par l'utilisateur).
+  const shareNoteNative = async () => {
+    if (!note) return false;
+    if (!navigator.share) return false;
+
+    try {
+      await navigator.share({
+        title: note.title || 'Note sans titre',
+        text: (note.text || '').slice(0, 500),
+      });
+      return true;
+    } catch (err) {
+      if (err.name === 'AbortError') return true; // l'utilisateur a annulé : pas de menu de secours
+      console.error('Erreur de partage natif :', err);
+      return false;
+    }
+  };
+
+  const openShareMenu = async () => {
     const opening = openDD !== 'share';
 
     if (opening) {
       const sharedNatively = await shareNoteNative();
-      if (sharedNatively) return; // le panneau natif a été utilisé, pas besoin du menu custom
+      if (sharedNatively) return; // panneau natif utilisé, pas besoin du menu custom
     }
 
     setShareError('');
@@ -247,25 +266,6 @@ export default function NoteEditor({
     }
     setOpenDD(opening ? 'share' : null);
   };
-  
-    const shareNoteNative = async () => {
-    if (!note) return false;
-    if (!navigator.share) return false;
-
-    try {
-      await navigator.share({
-        title: note.title || 'Note sans titre',
-        text: note.content?.replace(/<[^>]*>/g, '').slice(0, 200) || '',
-      });
-      return true;
-    } catch (err) {
-      if (err.name === 'AbortError') return true; // l'utilisateur a annulé, ne pas ouvrir le fallback
-      console.error('Erreur de partage natif :', err);
-      return false;
-    }
-  };
-
-  
 
   const createNoteShare = async (recipientId, permission = 'editor') => {
     if (!note || !recipientId || shareBusy) return;
@@ -396,9 +396,6 @@ export default function NoteEditor({
   const toggle   = (name) => setOpenDD((prev) => (prev === name ? null : name));
   const closeAll = () => { setOpenDD(null); setSearchOpen(false); setTableCtxMenu(null); };
 
-  const updateNote = (patch) =>
-    setNotes((prev) => prev.map((n) => (n.id === selectedId ? { ...n, ...patch } : n)));
-
   const setColor = (colorName) => { updateActiveCard({ color: colorName }); closeAll(); };
 
   // ── Modal renommage ───────────────────────────────────────────────────────
@@ -441,14 +438,9 @@ export default function NoteEditor({
     updateMainTextFormat({ style: styleName });
   };
 
-  const removeListFormatting = (text) => text
-    .split('\n')
-    .map((line) => line.replace(LIST_PREFIX_PATTERN, ''))
-    .join('\n');
-
   const disableList = () => {
     if (!note) return;
-    const currentText = activeCard?.text ?? ''; 
+    const currentText = activeCard?.text ?? '';
     const textarea = mainTextareaRef.current;
     const selStart = textarea ? textarea.selectionStart : 0;
     const selEnd = textarea ? textarea.selectionEnd : 0;
@@ -469,7 +461,7 @@ export default function NoteEditor({
       return;
     }
 
-    const currentText = activeCard?.text ?? ''; 
+    const currentText = activeCard?.text ?? '';
     const textarea = mainTextareaRef.current;
     const selStart = textarea ? textarea.selectionStart : 0;
     const selEnd = textarea ? textarea.selectionEnd : currentText.length;
@@ -556,49 +548,94 @@ export default function NoteEditor({
     closeAll();
   };
 
-  const updateCell = (tableId, r, c, value, cardIndex = activeCardIndex) => {
-    const tables = (activeCard?.tables || []).map((t) => {
-      if (t.id !== tableId) return t;
-      return { ...t, data: t.data.map((row, ri) => ri === r ? row.map((cell, ci) => ci === c ? value : cell) : row) };
-    });
-    updateNote({ tables });
+  // Modifie les tableaux de la carte visée (et pas seulement de la note),
+  // car l'affichage lit card.tables.
+  const updateTablesAt = (cardIndex, transform) => {
+    if (!note) return;
+    const targetCard = getCards(note)[cardIndex];
+    if (!targetCard) return;
+    updateCardAt(cardIndex, { tables: transform(targetCard.tables || []) });
   };
 
-  const tableAddColBefore = (tableId, colIdx) => {
-    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : { ...t, cols: t.cols + 1, data: t.data.map((row) => [...row.slice(0, colIdx), '', ...row.slice(colIdx)]) });
-    updateNote({ tables }); setTableCtxMenu(null);
+  const updateCell = (tableId, r, c, value, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.map((t) => (
+      t.id !== tableId ? t : {
+        ...t,
+        data: t.data.map((row, ri) => (ri === r ? row.map((cell, ci) => (ci === c ? value : cell)) : row)),
+      }
+    )));
   };
-  const tableAddColAfter = (tableId, colIdx) => {
-    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : { ...t, cols: t.cols + 1, data: t.data.map((row) => [...row.slice(0, colIdx + 1), '', ...row.slice(colIdx + 1)]) });
-    updateNote({ tables }); setTableCtxMenu(null);
+
+  const tableAddColBefore = (tableId, colIdx, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.map((t) => (
+      t.id !== tableId ? t : {
+        ...t,
+        cols: t.cols + 1,
+        data: t.data.map((row) => [...row.slice(0, colIdx), '', ...row.slice(colIdx)]),
+      }
+    )));
+    setTableCtxMenu(null);
   };
-  const tableDeleteCol = (tableId, colIdx) => {
-    const tables = (activeCard?.tables || []).map((t) => (t.id !== tableId || t.cols <= 1) ? t : { ...t, cols: t.cols - 1, data: t.data.map((row) => row.filter((_, ci) => ci !== colIdx)) });
-    updateNote({ tables }); setTableCtxMenu(null);
+
+  const tableAddColAfter = (tableId, colIdx, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.map((t) => (
+      t.id !== tableId ? t : {
+        ...t,
+        cols: t.cols + 1,
+        data: t.data.map((row) => [...row.slice(0, colIdx + 1), '', ...row.slice(colIdx + 1)]),
+      }
+    )));
+    setTableCtxMenu(null);
   };
-  const tableAddRowBefore = (tableId, rowIdx) => {
-    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : {
-      ...t,
-      rows: t.rows + 1,
-      data: [...t.data.slice(0, rowIdx), Array(t.cols).fill(''), ...t.data.slice(rowIdx)],
-    });
-    updateNote({ tables }); setTableCtxMenu(null);
+
+  const tableDeleteCol = (tableId, colIdx, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.map((t) => (
+      (t.id !== tableId || t.cols <= 1) ? t : {
+        ...t,
+        cols: t.cols - 1,
+        data: t.data.map((row) => row.filter((_, ci) => ci !== colIdx)),
+      }
+    )));
+    setTableCtxMenu(null);
   };
-  const tableAddRowAfter = (tableId, rowIdx) => {
-    const tables = (activeCard?.tables || []).map((t) => t.id !== tableId ? t : {
-      ...t,
-      rows: t.rows + 1,
-      data: [...t.data.slice(0, rowIdx + 1), Array(t.cols).fill(''), ...t.data.slice(rowIdx + 1)],
-    });
-    updateNote({ tables }); setTableCtxMenu(null);
+
+  const tableAddRowBefore = (tableId, rowIdx, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.map((t) => (
+      t.id !== tableId ? t : {
+        ...t,
+        rows: t.rows + 1,
+        data: [...t.data.slice(0, rowIdx), Array(t.cols).fill(''), ...t.data.slice(rowIdx)],
+      }
+    )));
+    setTableCtxMenu(null);
   };
-  const tableDeleteRow = (tableId, rowIdx) => {
-    const tables = (activeCard?.tables || []).map((t) => (t.id !== tableId || t.rows <= 1) ? t : {
-      ...t,
-      rows: t.rows - 1,
-      data: t.data.filter((_, index) => index !== rowIdx),
-    });
-    updateNote({ tables }); setTableCtxMenu(null);
+
+  const tableAddRowAfter = (tableId, rowIdx, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.map((t) => (
+      t.id !== tableId ? t : {
+        ...t,
+        rows: t.rows + 1,
+        data: [...t.data.slice(0, rowIdx + 1), Array(t.cols).fill(''), ...t.data.slice(rowIdx + 1)],
+      }
+    )));
+    setTableCtxMenu(null);
+  };
+
+  const tableDeleteRow = (tableId, rowIdx, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.map((t) => (
+      (t.id !== tableId || t.rows <= 1) ? t : {
+        ...t,
+        rows: t.rows - 1,
+        data: t.data.filter((_, index) => index !== rowIdx),
+      }
+    )));
+    setTableCtxMenu(null);
+  };
+
+  // Supprime le tableau entier de la carte visée.
+  const tableDelete = (tableId, cardIndex = activeCardIndex) => {
+    updateTablesAt(cardIndex, (tables) => tables.filter((t) => t.id !== tableId));
+    setTableCtxMenu(null);
   };
 
   // ── Media ─────────────────────────────────────────────────────────────────
@@ -898,8 +935,8 @@ export default function NoteEditor({
   const buildMailtoUrl = (currentNote) => {
     if (!currentNote) return '#';
 
-    const cards = getCards(currentNote);
-    const body = cards
+    const noteCards = getCards(currentNote);
+    const body = noteCards
       .map((card) => {
         const title = card.subtitle || 'Untitled';
         const text = card.text || '';
@@ -909,7 +946,7 @@ export default function NoteEditor({
           .join('\n\n');
 
         return [
-          cards.length > 1 ? `--- ${title} ---` : '',
+          noteCards.length > 1 ? `--- ${title} ---` : '',
           text,
           tables,
         ].filter(Boolean).join('\n');
@@ -930,10 +967,6 @@ export default function NoteEditor({
     }
     closeAll();
   };
-
-
-
-  
 
   // ── Rendu des tableaux d'une slide ───────────────────────────────────────
   const renderCardTables = (card, globalIdx) => {
@@ -975,17 +1008,19 @@ export default function NoteEditor({
           </tbody>
         </table>
         {tableCtxMenu?.tableId === tbl.id && tableCtxMenu?.cardIndex === globalIdx && (
-          <div className="table-ctx-menu" onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', zIndex: 999, minWidth: '170px', overflow: 'hidden', top: tableCtxMenu.type === 'column' ? '20px' : `calc(20px + ${(tableCtxMenu.index / tbl.rows) * 100}%)`, left: tableCtxMenu.type === 'column' ? `calc(20px + ${(tableCtxMenu.index / tbl.cols) * 100}%)` : '-150px', background: 'rgba(238,238,238,0.98)', border: '1px solid #dedede', borderRadius: '8px', boxShadow: '0 5px 18px rgba(0,0,0,.18)' }}>
+          <div className="table-ctx-menu" onClick={(e) => e.stopPropagation()} style={{ position: 'absolute', zIndex: 999, minWidth: '170px', overflow: 'hidden', top: tableCtxMenu.type === 'column' ? '20px' : `calc(20px + ${(tableCtxMenu.index / tbl.rows) * 100}%)`, ...(tableCtxMenu.type === 'row' ? { left: '24px' } : (tableCtxMenu.index >= tbl.cols / 2 ? { right: 0 } : { left: `calc(20px + ${(tableCtxMenu.index / tbl.cols) * 100}%)` })), background: 'rgba(238,238,238,0.98)', border: '1px solid #dedede', borderRadius: '8px', boxShadow: '0 5px 18px rgba(0,0,0,.18)' }}>
             {(tableCtxMenu.type === 'column' ? [
-              { label: 'Insert a front column', action: () => tableAddColBefore(tbl.id, tableCtxMenu.index) },
-              { label: 'Insert column after', action: () => tableAddColAfter(tbl.id, tableCtxMenu.index) },
-              { label: 'Delete column', action: () => tableDeleteCol(tbl.id, tableCtxMenu.index), destructive: true },
+              { label: 'Insert a front column', action: () => tableAddColBefore(tbl.id, tableCtxMenu.index, tableCtxMenu.cardIndex) },
+              { label: 'Insert column after', action: () => tableAddColAfter(tbl.id, tableCtxMenu.index, tableCtxMenu.cardIndex) },
+              { label: 'Delete column', action: () => tableDeleteCol(tbl.id, tableCtxMenu.index, tableCtxMenu.cardIndex), destructive: true },
+              { label: 'Delete table', action: () => tableDelete(tbl.id, tableCtxMenu.cardIndex), destructive: true },
             ] : [
-              { label: 'Insert a row above', action: () => tableAddRowBefore(tbl.id, tableCtxMenu.index) },
-              { label: 'Insert a row below', action: () => tableAddRowAfter(tbl.id, tableCtxMenu.index) },
-              { label: 'Delete row', action: () => tableDeleteRow(tbl.id, tableCtxMenu.index), destructive: true },
-            ]).map(({ label, action, destructive }, optionIndex) => (
-              <button key={label} onClick={action} style={{ display: 'block', width: '100%', padding: '9px 14px', textAlign: 'left', background: 'none', border: 'none', borderTop: optionIndex === 2 ? '1px solid #c9c9c9' : 'none', cursor: 'pointer', fontSize: '13px', color: destructive ? '#111' : '#111' }}>
+              { label: 'Insert a row above', action: () => tableAddRowBefore(tbl.id, tableCtxMenu.index, tableCtxMenu.cardIndex) },
+              { label: 'Insert a row below', action: () => tableAddRowAfter(tbl.id, tableCtxMenu.index, tableCtxMenu.cardIndex) },
+              { label: 'Delete row', action: () => tableDeleteRow(tbl.id, tableCtxMenu.index, tableCtxMenu.cardIndex), destructive: true },
+              { label: 'Delete table', action: () => tableDelete(tbl.id, tableCtxMenu.cardIndex), destructive: true },
+            ]).map(({ label, action, destructive }) => (
+              <button key={label} onClick={action} style={{ display: 'block', width: '100%', padding: '9px 14px', textAlign: 'left', background: 'none', border: 'none', borderTop: destructive ? '1px solid #c9c9c9' : 'none', cursor: 'pointer', fontSize: '13px', color: '#111' }}>
                 {label}
               </button>
             ))}
@@ -1265,79 +1300,41 @@ export default function NoteEditor({
         </div>
 
         {/* ── TABLEAU ── */}
-<div className="rel">
-  <button
-    type="button"
-    onClick={(e) => {
-      e.stopPropagation();
-
-      if (!note) return;
-
-      // Ajoute un nouveau tableau sans supprimer les tableaux existants
-      insertTable(2, 2);
-    }}
-    title={
-      activeCard?.tables?.length > 0
-        ? 'Add another table'
-        : 'Add a table'
-    }
-    style={{
-      background:
-        activeCard?.tables?.length > 0
-          ? '#dcdcdc'
-          : 'transparent',
-      borderRadius: '5px',
-      border: 'none',
-      padding: '6px 10px',
-      cursor: 'pointer',
-    }}
-  >
-    <svg
-      width="18"
-      height="14"
-      viewBox="0 0 18 14"
-      fill="none"
-      aria-hidden="true"
-    >
-      <rect
-        x="0.5"
-        y="0.5"
-        width="17"
-        height="13"
-        rx="1.5"
-        stroke="#857f7f"
-        strokeWidth="1"
-      />
-      <line
-        x1="9"
-        y1="0.5"
-        x2="9"
-        y2="13.5"
-        stroke="#857f7f"
-        strokeWidth="1"
-      />
-      <line
-        x1="0.5"
-        y1="7"
-        x2="17.5"
-        y2="7"
-        stroke="#857f7f"
-        strokeWidth="1"
-      />
-    </svg>
-  </button>
-</div>
+        <div className="rel">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!note) return;
+              // Ajoute un nouveau tableau sans supprimer les tableaux existants
+              insertTable(2, 2);
+            }}
+            title={activeCard?.tables?.length > 0 ? 'Add another table' : 'Add a table'}
+            style={{
+              background: activeCard?.tables?.length > 0 ? '#dcdcdc' : 'transparent',
+              borderRadius: '5px',
+              border: 'none',
+              padding: '6px 10px',
+              cursor: 'pointer',
+            }}
+          >
+            <svg width="18" height="14" viewBox="0 0 18 14" fill="none" aria-hidden="true">
+              <rect x="0.5" y="0.5" width="17" height="13" rx="1.5" stroke="#857f7f" strokeWidth="1" />
+              <line x1="9" y1="0.5" x2="9" y2="13.5" stroke="#857f7f" strokeWidth="1" />
+              <line x1="0.5" y1="7" x2="17.5" y2="7" stroke="#857f7f" strokeWidth="1" />
+            </svg>
+          </button>
+        </div>
 
         {/* ── IMAGE / MEDIA ── */}
         <div className="rel">
-          {/* IMAGE / MEDIA */}
-<button
-  onClick={() => toggle('media')}
-  title="Open your device's photo browser"
-  className={`toolbar-light-icon ${openDD === 'media' ? 'active' : ''}`}
->
-  <i className="fa-regular fa-image"></i>
-</button>
+          <button
+            onClick={() => toggle('media')}
+            title="Open your device's photo browser"
+            className={`toolbar-light-icon ${openDD === 'media' ? 'active' : ''}`}
+          >
+            <i className="fa-regular fa-image"></i>
+          </button>
           {openDD === 'media' && (
             <div className="media-dropdown" onClick={(e) => e.stopPropagation()}>
               <button className="media-item media-item-top" onClick={() => { setMediaModal(true); setMediaTab('photos'); closeAll(); }}>Photos &amp; Videos</button>
@@ -1354,12 +1351,12 @@ export default function NoteEditor({
         {/* ── LIEN ── */}
         <div className="rel">
           <button
-  onClick={() => toggle('link')}
-  title="Add a link"
-  className={`toolbar-light-icon ${openDD === 'link' ? 'active' : ''}`}
->
-  <i className="fa-solid fa-link"></i>
-</button>
+            onClick={() => toggle('link')}
+            title="Add a link"
+            className={`toolbar-light-icon ${openDD === 'link' ? 'active' : ''}`}
+          >
+            <i className="fa-solid fa-link"></i>
+          </button>
           {openDD === 'link' && (
             <div className="link-dropdown" onClick={(e) => e.stopPropagation()}>
               <div className="link-dropdown-title">Add a link to the app</div>
@@ -1399,20 +1396,13 @@ export default function NoteEditor({
 
         {/* ── LOCK ── */}
         <div className="rel">
-          {/* LOCK */}
-<button
-  onClick={() => toggle('lock')}
-  title="Verrouiller"
-  className={`toolbar-light-icon ${
-    openDD === 'lock' || activeCard?.isLocked ? 'active' : ''
-  }`}
->
-  <i
-    className={`fa-solid ${
-      activeCard?.isLocked ? 'fa-lock' : 'fa-lock-open'
-    }`}
-  ></i>
-</button>
+          <button
+            onClick={() => toggle('lock')}
+            title="Verrouiller"
+            className={`toolbar-light-icon ${openDD === 'lock' || activeCard?.isLocked ? 'active' : ''}`}
+          >
+            <i className={`fa-solid ${activeCard?.isLocked ? 'fa-lock' : 'fa-lock-open'}`}></i>
+          </button>
           {openDD === 'lock' && (
             <div className="lock-dropdown">
               <button className="lock-item" onClick={handleLockToggleAction}>{activeCard?.isLocked ? 'Unlock this slide' : 'Lock this slide'}</button>
@@ -1424,12 +1414,12 @@ export default function NoteEditor({
         {/* ── PARTAGER ── */}
         <div className="rel">
           <button
-  onClick={(e) => { e.stopPropagation(); openShareMenu(); }}
-  title="Partager"
-  className={`toolbar-light-icon ${openDD === 'share' ? 'active' : ''}`}
->
-  <i className="fa-solid fa-arrow-up-from-bracket"></i>
-</button>
+            onClick={(e) => { e.stopPropagation(); openShareMenu(); }}
+            title="Partager"
+            className={`toolbar-light-icon ${openDD === 'share' ? 'active' : ''}`}
+          >
+            <i className="fa-solid fa-arrow-up-from-bracket"></i>
+          </button>
           {openDD === 'share' && (
             <div className="share-dropdown" onClick={(e) => e.stopPropagation()}>
               <div className="share-header">
@@ -1515,30 +1505,24 @@ export default function NoteEditor({
               <div className="share-divider"></div>
 
               <a
-  className="share-app-row"
-  href={buildMailtoUrl(note)}
-  onClick={sendNoteByMail}
-  title="Envoyer une copie de la note par e-mail"
-  style={{
-    display: 'flex',
-    alignItems: 'center',
-    textDecoration: 'none',
-    color: 'inherit',
-    width: '100%',
-    cursor: 'pointer'
-  }}
->
-  <div className="app-icon-mail">
-    <i className="fa-solid fa-envelope"></i>
-  </div>
-
-  <span className="app-label">Mail</span>
-</a>
-
-           
-
-
-              
+                className="share-app-row"
+                href={buildMailtoUrl(note)}
+                onClick={sendNoteByMail}
+                title="Envoyer une copie de la note par e-mail"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  textDecoration: 'none',
+                  color: 'inherit',
+                  width: '100%',
+                  cursor: 'pointer',
+                }}
+              >
+                <div className="app-icon-mail">
+                  <i className="fa-solid fa-envelope"></i>
+                </div>
+                <span className="app-label">Mail</span>
+              </a>
             </div>
           )}
         </div>
@@ -1560,16 +1544,16 @@ export default function NoteEditor({
         }}>
           <button title="Search" onClick={(e) => { e.stopPropagation(); if (searchOpen) { closeAll(); } else { closeAll(); setSearchOpen(true); } }}
             style={{
-  background: 'transparent',
-  border: 'none',
-  padding: '6px 10px',
-  cursor: 'pointer',
-  borderRadius: '5px',
-  opacity: searchOpen ? 0 : 1,
-  visibility: searchOpen ? 'hidden' : 'visible',
-  pointerEvents: searchOpen ? 'none' : 'auto',
-  transition: 'opacity 0.15s ease',
-}}
+              background: 'transparent',
+              border: 'none',
+              padding: '6px 10px',
+              cursor: 'pointer',
+              borderRadius: '5px',
+              opacity: searchOpen ? 0 : 1,
+              visibility: searchOpen ? 'hidden' : 'visible',
+              pointerEvents: searchOpen ? 'none' : 'auto',
+              transition: 'opacity 0.15s ease',
+            }}
             onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(0,0,0,0.05)'}
             onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}>
             <i className="fa-solid fa-magnifying-glass" style={{ fontSize: '16px', color: '#857f7f' }}></i>
@@ -1630,7 +1614,7 @@ export default function NoteEditor({
         </div>
       </div>
 
-       {/* ═══ FOOTER + BOUTONS BAS (sur la même ligne) ════════════════════ */}
+      {/* ═══ FOOTER + BOUTONS BAS (sur la même ligne) ════════════════════ */}
       <div className="editor-bottom" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '16px', padding: '14px 20px', background: '#fff', borderTop: '1px solid #e5e7eb' }}>
 
         {/* Champ titre — visible seulement quand il y a des cartes groupées */}
@@ -1663,26 +1647,9 @@ export default function NoteEditor({
           onClick={addGroupCard}
           title="Add more notes on the same doc"
           aria-label="Ajouter une carte"
-          style={{
-            width: '62px',
-            height: '62px',
-            padding: 0,
-            border: 'none',
-            borderRadius: '10px',
-            background: '#ffffff',
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            overflow: 'hidden',
-          }}
+          style={{ width: '62px', height: '62px', padding: 0, border: 'none', borderRadius: '10px', background: '#ffffff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}
         >
-          <img
-            src={bas1}
-            alt=""
-            aria-hidden="true"
-            style={{ width: '100%', height: '100%', display: 'block', objectFit: 'cover' }}
-          />
+          <img src={bas1} alt="" aria-hidden="true" style={{ width: '100%', height: '100%', display: 'block', objectFit: 'cover' }} />
         </button>
 
         {/* Image rouge : supprime la dernière carte */}
@@ -1691,26 +1658,9 @@ export default function NoteEditor({
           onClick={removeLastGroupCard}
           title="Remove last note"
           aria-label="Supprimer la dernière carte"
-          style={{
-            width: '62px',
-            height: '62px',
-            padding: 0,
-            border: 'none',
-            borderRadius: '10px',
-            background: '#ffffff',
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            overflow: 'hidden',
-          }}
+          style={{ width: '62px', height: '62px', padding: 0, border: 'none', borderRadius: '10px', background: '#ffffff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}
         >
-          <img
-            src={bas2}
-            alt=""
-            aria-hidden="true"
-            style={{ width: '100%', height: '100%', display: 'block', objectFit: 'cover' }}
-          />
+          <img src={bas2} alt="" aria-hidden="true" style={{ width: '100%', height: '100%', display: 'block', objectFit: 'cover' }} />
         </button>
 
         {/* Image verte : ouvre la modal pour renommer */}
@@ -1719,28 +1669,12 @@ export default function NoteEditor({
           onClick={openRenameModal}
           title="Rename this group of cards"
           aria-label="Renommer le groupe de cartes"
-          style={{
-            width: '62px',
-            height: '62px',
-            padding: 0,
-            border: 'none',
-            borderRadius: '10px',
-            background: '#ffffff',
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            overflow: 'hidden',
-          }}
+          style={{ width: '62px', height: '62px', padding: 0, border: 'none', borderRadius: '10px', background: '#ffffff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}
         >
-          <img
-            src={bas3}
-            alt=""
-            aria-hidden="true"
-            style={{ width: '100%', height: '100%', display: 'block', objectFit: 'cover' }}
-          />
+          <img src={bas3} alt="" aria-hidden="true" style={{ width: '100%', height: '100%', display: 'block', objectFit: 'cover' }} />
         </button>
       </div>
+
       {/* ═══ MODAL RENOMMAGE ═════════════════════════════════════════════ */}
       {isRenameModalOpen && (
         <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
